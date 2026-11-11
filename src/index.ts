@@ -19,6 +19,8 @@ type Bindings = {
   RUNNER_URL: string;
   /** Shared with the xaas-workflows app for `POST /runs`. */
   INGRESS_API_TOKEN?: string;
+  /** Optional second token, accepted next to the first while the token is rotated: set it, switch the app, then move it into INGRESS_API_TOKEN. */
+  INGRESS_API_TOKEN_NEXT?: string;
 };
 
 type Sql = NeonQueryFunction<false, false>;
@@ -69,8 +71,11 @@ type StartRun = {
   workflowId: string;
   workflowVersionId: string;
   triggerId: string | null;
-  triggerType: "cron" | "webhook" | "manual";
+  triggerType: "cron" | "webhook" | "manual" | "retry";
   input: Record<string, unknown>;
+  triggeredBy?: string | null;
+  retryOf?: string | null;
+  env?: "production" | "staging";
 };
 
 /** Creates the run row and hands the run to the runner through Upstash Workflow. */
@@ -81,9 +86,9 @@ async function startRun(sql: Sql, env: Bindings, run: StartRun): Promise<string>
     with counter as (
       update workspaces set run_counter = run_counter + 1 where id = ${run.workspaceId} returning run_counter
     )
-    insert into runs (id, no, workspace_id, workflow_id, workflow_version_id, trigger_id, trigger_type, input)
+    insert into runs (id, no, workspace_id, workflow_id, workflow_version_id, trigger_id, trigger_type, input, triggered_by, retry_of, env)
     select ${runId}, counter.run_counter, ${run.workspaceId}, ${run.workflowId}, ${run.workflowVersionId}, ${run.triggerId},
-      ${run.triggerType}, ${JSON.stringify(run.input)}::jsonb
+      ${run.triggerType}, ${JSON.stringify(run.input)}::jsonb, ${run.triggeredBy ?? null}::uuid, ${run.retryOf ?? null}::uuid, ${run.env ?? "production"}
     from counter`;
 
   try {
@@ -179,10 +184,19 @@ app.post("/internal/triggers/:id/fire", async (c) => {
   return c.json(await fireTrigger(neon(c.env.DATABASE_URL), c.env, { triggerId }, {}));
 });
 
+/** Compares two secrets without stopping at the first different character. */
+function sameSecret(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
 app.post("/runs", async (c) => {
-  const expected = c.env.INGRESS_API_TOKEN;
-  if (!expected) return c.json({ error: "api_token_not_configured" }, 503);
-  if (c.req.header("authorization") !== `Bearer ${expected}`) return c.json({ error: "unauthorized" }, 401);
+  const tokens = [c.env.INGRESS_API_TOKEN, c.env.INGRESS_API_TOKEN_NEXT].filter((token): token is string => Boolean(token));
+  if (tokens.length === 0) return c.json({ error: "api_token_not_configured" }, 503);
+  const given = c.req.header("authorization") ?? "";
+  if (!tokens.some((token) => sameSecret(given, `Bearer ${token}`))) return c.json({ error: "unauthorized" }, 401);
 
   const body = parseJsonObject(await c.req.text());
   if (!body.ok) return c.json({ error: body.error }, body.status);
@@ -192,18 +206,34 @@ app.post("/runs", async (c) => {
   if (typeof workflowId !== "string" || !UUID.test(workflowId)) return c.json({ error: "workflowId_must_be_a_uuid" }, 400);
   if (!isRecord(input)) return c.json({ error: "input_must_be_a_json_object" }, 400);
 
+  // Who started it, which run it repeats, which environment and (to repeat a run) which version; all optional.
+  const optionalUuid = (value: unknown) => (typeof value === "string" && UUID.test(value) ? value : value === undefined || value === null ? null : false);
+  const triggeredBy = optionalUuid(body.value.triggeredBy);
+  const retryOf = optionalUuid(body.value.retryOf);
+  const versionId = optionalUuid(body.value.workflowVersionId);
+  if (triggeredBy === false || retryOf === false || versionId === false) return c.json({ error: "ids_must_be_uuids" }, 400);
+  const env = body.value.env ?? "production";
+  if (env !== "production" && env !== "staging") return c.json({ error: "env_must_be_production_or_staging" }, 400);
+
   const sql = neon(c.env.DATABASE_URL);
   const [workflow] = await sql`select workspace_id, current_version_id from workflows where id = ${workflowId}`;
   if (!workflow) return c.json({ error: "not_found" }, 404);
   if (!workflow.current_version_id) return c.json({ error: "workflow_not_published" }, 409);
+  if (versionId) {
+    const [version] = await sql`select 1 as ok from workflow_versions where id = ${versionId} and workflow_id = ${workflowId} and status = 'published'`;
+    if (!version) return c.json({ error: "version_not_found" }, 404);
+  }
 
   const runId = await startRun(sql, c.env, {
     workspaceId: workflow.workspace_id,
     workflowId,
-    workflowVersionId: workflow.current_version_id,
+    workflowVersionId: versionId ?? workflow.current_version_id,
     triggerId: null,
-    triggerType: "manual",
+    triggerType: retryOf ? "retry" : "manual",
     input,
+    triggeredBy,
+    retryOf,
+    env,
   });
   return c.json({ status: "accepted", runId }, 202);
 });
