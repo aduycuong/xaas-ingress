@@ -114,7 +114,7 @@ npm run deploy
 
 - Deploy không gây gián đoạn và không ảnh hưởng tới run đang chạy: sau khi trigger, run chỉ còn đi giữa Upstash và runner.
 - Secret giữ nguyên qua các lần deploy; chỉ đặt lại khi đổi giá trị.
-- Khi runner có route mới (`/run/v2`), đổi hằng `RUNNER_ROUTE` trong `src/index.ts` rồi deploy lại; run mới sẽ đi vào route mới.
+- Khi runner có route mới (`/run/v3`), đổi hằng `RUNNER_ROUTE` trong `src/index.ts` rồi deploy lại; run mới sẽ đi vào route mới.
 
 ### Quay lại bản trước và xem log
 
