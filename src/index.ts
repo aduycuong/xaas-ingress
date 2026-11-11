@@ -27,7 +27,7 @@ type Sql = NeonQueryFunction<false, false>;
 const MAX_BODY_BYTES = 256 * 1024;
 
 /** Route of the runner. A runner change that reorders or renames steps comes with a new route. */
-const RUNNER_ROUTE = "/run/v2";
+const RUNNER_ROUTE = "/run/v3";
 
 function uuidv7(now: number = Date.now()): string {
   const bytes = new Uint8Array(16);
@@ -76,10 +76,15 @@ type StartRun = {
 /** Creates the run row and hands the run to the runner through Upstash Workflow. */
 async function startRun(sql: Sql, env: Bindings, run: StartRun): Promise<string> {
   const runId = uuidv7();
+  // The run number comes from the workspace counter, taken in the same statement that creates the run.
   await sql`
-    insert into runs (id, workspace_id, workflow_id, workflow_version_id, trigger_id, trigger_type, input)
-    values (${runId}, ${run.workspaceId}, ${run.workflowId}, ${run.workflowVersionId}, ${run.triggerId},
-      ${run.triggerType}, ${JSON.stringify(run.input)}::jsonb)`;
+    with counter as (
+      update workspaces set run_counter = run_counter + 1 where id = ${run.workspaceId} returning run_counter
+    )
+    insert into runs (id, no, workspace_id, workflow_id, workflow_version_id, trigger_id, trigger_type, input)
+    select ${runId}, counter.run_counter, ${run.workspaceId}, ${run.workflowId}, ${run.workflowVersionId}, ${run.triggerId},
+      ${run.triggerType}, ${JSON.stringify(run.input)}::jsonb
+    from counter`;
 
   try {
     const client = new Client({ token: env.QSTASH_TOKEN, baseUrl: env.QSTASH_URL || undefined });
