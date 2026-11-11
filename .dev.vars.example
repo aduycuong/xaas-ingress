@@ -1,0 +1,11 @@
+# Copy to .dev.vars (not committed). Used by wrangler dev.
+DATABASE_URL=
+QSTASH_TOKEN=
+QSTASH_CURRENT_SIGNING_KEY=
+QSTASH_NEXT_SIGNING_KEY=
+# Only when your QStash is not on the default endpoint (regional, or the local dev server).
+# QSTASH_URL=
+# Where Upstash reaches the runner Worker, without a trailing slash.
+RUNNER_URL=
+# Shared with the xaas-workflows app for POST /runs.
+INGRESS_API_TOKEN=
