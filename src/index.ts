@@ -1,50 +1,22 @@
 // Ingress Worker: every way a run is started from outside goes through here.
-//   POST /wh/:token                     webhook trigger (the token in the URL is the credential)
-//   POST /internal/triggers/:id/fire    QStash schedule of a cron trigger (Upstash signature)
-//   POST /runs                          manual run from the xaas-workflows app (bearer token)
+//   POST /wh/:token                          webhook or manual-API trigger (token in the URL, plus the trigger's own auth)
+//   POST /internal/triggers/:id/fire         QStash schedule of a cron trigger (Upstash signature)
+//   POST /internal/events/run-finished       QStash message from the runner when a run ends (Upstash signature)
+//   POST /triggers/:id/fire                  "Fire now" from the xaas-workflows app (bearer token)
+//   POST /dispatch-queued                    the app's sweep: start queued runs whose trigger has a free slot (bearer token)
+//   POST /runs                               manual run from the xaas-workflows app (bearer token)
 // Database access is plain SQL: the tables are owned and migrated by the xaas-workflows app.
 
-import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
+import { neon } from "@neondatabase/serverless";
 import { Receiver } from "@upstash/qstash";
-import { Client } from "@upstash/workflow";
 import { Hono } from "hono";
-
-type Bindings = {
-  DATABASE_URL: string;
-  QSTASH_TOKEN: string;
-  QSTASH_URL?: string;
-  QSTASH_CURRENT_SIGNING_KEY?: string;
-  QSTASH_NEXT_SIGNING_KEY?: string;
-  /** Public URL of the runner Worker, without a trailing slash. */
-  RUNNER_URL: string;
-  /** Shared with the xaas-workflows app for `POST /runs`. */
-  INGRESS_API_TOKEN?: string;
-  /** Optional second token, accepted next to the first while the token is rotated: set it, switch the app, then move it into INGRESS_API_TOKEN. */
-  INGRESS_API_TOKEN_NEXT?: string;
-};
-
-type Sql = NeonQueryFunction<false, false>;
+import { sameSecret } from "./crypto";
+import { handleRunFinished } from "./events";
+import { authenticate, fireTrigger, loadTriggerById, loadTriggerByToken, logTriggerEvent, type FireOutcome } from "./fire";
+import { dispatchQueued, startRun, type Bindings } from "./runs";
 
 /** Largest request body accepted. The body becomes the run input. */
 const MAX_BODY_BYTES = 256 * 1024;
-
-/** Route of the runner. A runner change that reorders or renames steps comes with a new route. */
-const RUNNER_ROUTE = "/run/v3";
-
-function uuidv7(now: number = Date.now()): string {
-  const bytes = new Uint8Array(16);
-  crypto.getRandomValues(bytes);
-  bytes[0] = Math.floor(now / 0x10000000000) & 0xff;
-  bytes[1] = Math.floor(now / 0x100000000) & 0xff;
-  bytes[2] = Math.floor(now / 0x1000000) & 0xff;
-  bytes[3] = Math.floor(now / 0x10000) & 0xff;
-  bytes[4] = Math.floor(now / 0x100) & 0xff;
-  bytes[5] = now & 0xff;
-  bytes[6] = (bytes[6] & 0x0f) | 0x70;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -66,87 +38,33 @@ function parseJsonObject(raw: string): ParsedBody {
   return { ok: true, value };
 }
 
-type StartRun = {
-  workspaceId: string;
-  workflowId: string;
-  workflowVersionId: string;
-  triggerId: string | null;
-  triggerType: "cron" | "webhook" | "manual" | "retry";
-  input: Record<string, unknown>;
-  triggeredBy?: string | null;
-  retryOf?: string | null;
-  env?: "production" | "staging";
-};
-
-/** Creates the run row and hands the run to the runner through Upstash Workflow. */
-async function startRun(sql: Sql, env: Bindings, run: StartRun): Promise<string> {
-  const runId = uuidv7();
-  // The run number comes from the workspace counter, taken in the same statement that creates the run.
-  await sql`
-    with counter as (
-      update workspaces set run_counter = run_counter + 1 where id = ${run.workspaceId} returning run_counter
-    )
-    insert into runs (id, no, workspace_id, workflow_id, workflow_version_id, trigger_id, trigger_type, input, triggered_by, retry_of, env)
-    select ${runId}, counter.run_counter, ${run.workspaceId}, ${run.workflowId}, ${run.workflowVersionId}, ${run.triggerId},
-      ${run.triggerType}, ${JSON.stringify(run.input)}::jsonb, ${run.triggeredBy ?? null}::uuid, ${run.retryOf ?? null}::uuid, ${run.env ?? "production"}
-    from counter`;
-
-  try {
-    const client = new Client({ token: env.QSTASH_TOKEN, baseUrl: env.QSTASH_URL || undefined });
-    const { workflowRunId } = await client.trigger({
-      url: `${env.RUNNER_URL.replace(/\/$/, "")}${RUNNER_ROUTE}`,
-      workflowRunId: runId,
-      body: { runId },
-    });
-    await sql`update runs set engine_run_id = ${workflowRunId} where id = ${runId}`;
-  } catch (error) {
-    const failure = JSON.stringify({ code: "TRIGGER_FAILED", message: "The run could not be handed to the runner." });
-    await sql`update runs set status = 'failed', error = ${failure}::jsonb, finished_at = now() where id = ${runId}`;
-    throw error;
-  }
-  return runId;
-}
-
-type FireResult =
-  | { status: "started"; runId: string }
-  | { status: "skipped"; reason: "trigger_disabled" | "workflow_not_active" }
-  | { status: "not_found" };
-
-/** Starts a run for a trigger, unless the trigger is off or its workflow is not active. */
-async function fireTrigger(
-  sql: Sql,
-  env: Bindings,
-  match: { triggerId: string } | { webhookToken: string },
-  input: Record<string, unknown>,
-): Promise<FireResult> {
-  // One of the two is null; the trigger is matched by the other.
-  const triggerId = "triggerId" in match ? match.triggerId : null;
-  const webhookToken = "webhookToken" in match ? match.webhookToken : null;
-  const [trigger] = await sql`
-    select t.id, t.type, t.enabled, t.workspace_id, t.workflow_id, w.status as workflow_status, w.current_version_id
-    from triggers t join workflows w on w.id = t.workflow_id
-    where (${triggerId}::uuid is not null and t.id = ${triggerId}::uuid)
-       or (${webhookToken}::text is not null and t.type = 'webhook' and t.webhook_token = ${webhookToken}::text)
-    limit 1`;
-
-  if (!trigger) return { status: "not_found" };
-  if (!trigger.enabled) return { status: "skipped", reason: "trigger_disabled" };
-  if (trigger.workflow_status !== "active" || !trigger.current_version_id) {
-    return { status: "skipped", reason: "workflow_not_active" };
-  }
-
-  const runId = await startRun(sql, env, {
-    workspaceId: trigger.workspace_id,
-    workflowId: trigger.workflow_id,
-    workflowVersionId: trigger.current_version_id,
-    triggerId: trigger.id,
-    triggerType: trigger.type,
-    input,
-  });
-  return { status: "started", runId };
-}
-
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Verifies the Upstash signature of a QStash delivery and returns the body, or a response to send back. */
+async function verifiedQstashBody(c: { env: Bindings; req: { header(name: string): string | undefined; text(): Promise<string> } }): Promise<{ body: string } | { error: string; status: 401 | 503 }> {
+  const { QSTASH_CURRENT_SIGNING_KEY: currentSigningKey, QSTASH_NEXT_SIGNING_KEY: nextSigningKey } = c.env;
+  if (!currentSigningKey || !nextSigningKey) return { error: "qstash_not_configured", status: 503 };
+  const signature = c.req.header("upstash-signature");
+  if (!signature) return { error: "missing_signature", status: 401 };
+  const body = await c.req.text();
+  const valid = await new Receiver({ currentSigningKey, nextSigningKey }).verify({ signature, body }).catch(() => false);
+  return valid ? { body } : { error: "invalid_signature", status: 401 };
+}
+
+function hasApiToken(env: Bindings, header: string | undefined): boolean {
+  const tokens = [env.INGRESS_API_TOKEN, env.INGRESS_API_TOKEN_NEXT].filter((token): token is string => Boolean(token));
+  return tokens.some((token) => sameSecret(header ?? "", `Bearer ${token}`));
+}
+
+/** The HTTP answer for what firing a trigger did. */
+function answer(outcome: FireOutcome): { body: Record<string, unknown>; status: 200 | 202 | 401 | 409 | 422 | 429 } {
+  if (outcome.kind === "started") return { body: { status: outcome.queued ? "queued" : "accepted", runId: outcome.runId, no: outcome.no }, status: 202 };
+  if (outcome.kind === "rejected") {
+    if (outcome.reason === "filter_not_matched") return { body: { status: "ignored", reason: outcome.reason }, status: 200 };
+    return { body: { status: "rejected", reason: outcome.reason }, status: outcome.status === 422 ? 422 : outcome.status };
+  }
+  return { body: { status: "skipped", reason: outcome.reason }, status: 409 };
+}
 
 const app = new Hono<{ Bindings: Bindings }>();
 
@@ -154,49 +72,87 @@ app.get("/health", (c) => c.json({ ok: true }));
 
 app.onError((error, c) => {
   console.error("[ingress]", c.req.method, c.req.path, error);
-  // 500 makes QStash retry a schedule delivery.
+  // 500 makes QStash retry a delivery.
   return c.json({ error: "could_not_start_run" }, 500);
 });
 
 app.post("/wh/:token", async (c) => {
-  const body = parseJsonObject(await c.req.text());
+  const sql = neon(c.env.DATABASE_URL);
+  const trigger = await loadTriggerByToken(sql, c.req.param("token"));
+  if (!trigger) return c.json({ error: "not_found" }, 404);
+
+  // The raw text is what a signature covers: read it once, check it, then parse.
+  const raw = await c.req.text();
+  if (raw.length > MAX_BODY_BYTES) return c.json({ error: "payload_too_large" }, 413);
+  const problem = await authenticate(c.env, trigger, raw, c.req.raw.headers);
+  if (problem) {
+    await logTriggerEvent(sql, trigger, "rejected", problem, null);
+    return c.json({ error: problem }, 401);
+  }
+  const body = parseJsonObject(raw);
   if (!body.ok) return c.json({ error: body.error }, body.status);
 
-  const result = await fireTrigger(neon(c.env.DATABASE_URL), c.env, { webhookToken: c.req.param("token") }, body.value);
-  if (result.status === "not_found") return c.json({ error: "not_found" }, 404);
-  if (result.status === "skipped") return c.json(result, 409);
-  return c.json({ status: "accepted", runId: result.runId }, 202);
+  const query = Object.fromEntries(new URL(c.req.url).searchParams);
+  const outcome = await fireTrigger(sql, c.env, trigger, { body: body.value, headers: c.req.raw.headers, query, source: "webhook" });
+  const { body: out, status } = answer(outcome);
+  return c.json(out, status);
 });
 
 app.post("/internal/triggers/:id/fire", async (c) => {
-  const { QSTASH_CURRENT_SIGNING_KEY: currentSigningKey, QSTASH_NEXT_SIGNING_KEY: nextSigningKey } = c.env;
-  if (!currentSigningKey || !nextSigningKey) return c.json({ error: "qstash_not_configured" }, 503);
-
-  const signature = c.req.header("upstash-signature");
-  if (!signature) return c.json({ error: "missing_signature" }, 401);
-  const body = await c.req.text();
-  const valid = await new Receiver({ currentSigningKey, nextSigningKey }).verify({ signature, body }).catch(() => false);
-  if (!valid) return c.json({ error: "invalid_signature" }, 401);
+  const checked = await verifiedQstashBody(c);
+  if ("error" in checked) return c.json({ error: checked.error }, checked.status);
 
   const triggerId = c.req.param("id");
   if (!UUID.test(triggerId)) return c.json({ status: "not_found" });
-  // A trigger that is gone or turned off answers 200: a retry would not change the outcome.
-  return c.json(await fireTrigger(neon(c.env.DATABASE_URL), c.env, { triggerId }, {}));
+  const sql = neon(c.env.DATABASE_URL);
+  const trigger = await loadTriggerById(sql, triggerId);
+  // A trigger that is gone answers 200: a retry would not change the outcome.
+  if (!trigger) return c.json({ status: "not_found" });
+  return c.json(await fireTrigger(sql, c.env, trigger, { body: {}, source: "schedule" }));
 });
 
-/** Compares two secrets without stopping at the first different character. */
-function sameSecret(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
-}
+app.post("/internal/events/run-finished", async (c) => {
+  const checked = await verifiedQstashBody(c);
+  if ("error" in checked) return c.json({ error: checked.error }, checked.status);
+  let runId: unknown;
+  try {
+    runId = (JSON.parse(checked.body) as { runId?: unknown }).runId;
+  } catch {
+    return c.json({ error: "invalid_json" }, 400);
+  }
+  if (typeof runId !== "string" || !UUID.test(runId)) return c.json({ error: "runId_must_be_a_uuid" }, 400);
+  return c.json(await handleRunFinished(neon(c.env.DATABASE_URL), c.env, runId));
+});
+
+app.post("/triggers/:id/fire", async (c) => {
+  if (!hasApiToken(c.env, c.req.header("authorization"))) return c.json({ error: "unauthorized" }, 401);
+  const triggerId = c.req.param("id");
+  if (!UUID.test(triggerId)) return c.json({ error: "trigger_id_must_be_a_uuid" }, 400);
+  const body = parseJsonObject(await c.req.text());
+  if (!body.ok) return c.json({ error: body.error }, body.status);
+  const triggeredBy = typeof body.value.triggeredBy === "string" && UUID.test(body.value.triggeredBy) ? body.value.triggeredBy : null;
+  const input = isRecord(body.value.input) ? body.value.input : {};
+
+  const sql = neon(c.env.DATABASE_URL);
+  const trigger = await loadTriggerById(sql, triggerId);
+  if (!trigger) return c.json({ error: "not_found" }, 404);
+  const { body: out, status } = answer(await fireTrigger(sql, c.env, trigger, { body: input, source: "api", triggeredBy }));
+  return c.json(out, status);
+});
+
+app.post("/dispatch-queued", async (c) => {
+  if (!hasApiToken(c.env, c.req.header("authorization"))) return c.json({ error: "unauthorized" }, 401);
+  const sql = neon(c.env.DATABASE_URL);
+  // Triggers with runs waiting for a slot.
+  const waiting = (await sql`select distinct trigger_id from runs where status = 'queued' and dispatched_at is null and trigger_id is not null limit 200`) as unknown as { trigger_id: string }[];
+  let started = 0;
+  for (const { trigger_id } of waiting) started += await dispatchQueued(sql, c.env, trigger_id);
+  return c.json({ triggers: waiting.length, started });
+});
 
 app.post("/runs", async (c) => {
-  const tokens = [c.env.INGRESS_API_TOKEN, c.env.INGRESS_API_TOKEN_NEXT].filter((token): token is string => Boolean(token));
-  if (tokens.length === 0) return c.json({ error: "api_token_not_configured" }, 503);
-  const given = c.req.header("authorization") ?? "";
-  if (!tokens.some((token) => sameSecret(given, `Bearer ${token}`))) return c.json({ error: "unauthorized" }, 401);
+  if (!c.env.INGRESS_API_TOKEN && !c.env.INGRESS_API_TOKEN_NEXT) return c.json({ error: "api_token_not_configured" }, 503);
+  if (!hasApiToken(c.env, c.req.header("authorization"))) return c.json({ error: "unauthorized" }, 401);
 
   const body = parseJsonObject(await c.req.text());
   if (!body.ok) return c.json({ error: body.error }, body.status);
@@ -224,7 +180,7 @@ app.post("/runs", async (c) => {
     if (!version) return c.json({ error: "version_not_found" }, 404);
   }
 
-  const runId = await startRun(sql, c.env, {
+  const inserted = await startRun(sql, c.env, {
     workspaceId: workflow.workspace_id,
     workflowId,
     workflowVersionId: versionId ?? workflow.current_version_id,
@@ -235,7 +191,7 @@ app.post("/runs", async (c) => {
     retryOf,
     env,
   });
-  return c.json({ status: "accepted", runId }, 202);
+  return c.json({ status: "accepted", runId: inserted?.runId }, 202);
 });
 
 export default app;

@@ -151,3 +151,16 @@ npm run dev
 ```
 
 Ingress nghe ở cổng 8788.
+
+## Triggers
+
+| Ruta | Dùng cho | Xác thực |
+| --- | --- | --- |
+| `POST /wh/:token` | Trigger `webhook` và `manual` (API) | Token trong URL, cộng cấu hình của trigger: `hmac` (header `X-XaaS-Signature: sha256=<hex>` của body thô) hoặc `bearer` |
+| `POST /internal/triggers/:id/fire` | Schedule QStash của trigger `cron` | Chữ ký Upstash |
+| `POST /internal/events/run-finished` | Runner báo run kết thúc: chạy run đang chờ slot và bắn trigger `event` | Chữ ký Upstash |
+| `POST /triggers/:id/fire` | "Fire now" từ app | Bearer `INGRESS_API_TOKEN` |
+| `POST /dispatch-queued` | Sweep của app: khởi động run đang xếp hàng khi trigger còn slot | Bearer `INGRESS_API_TOKEN` |
+| `POST /runs` | Chạy workflow từ app | Bearer `INGRESS_API_TOKEN` |
+
+Mỗi lượt gọi trigger qua các bước: bật, workflow `active`, skip-once (schedule), rate limit, filter, input mapping, rồi chính sách concurrency; mọi kết quả ghi vào `trigger_events`. Secret HMAC / bearer lưu mã hóa; Worker cần secret `TRIGGERS_ENCRYPTION_KEY` (cùng giá trị với app). `src/graph.ts` giống từng byte với bản ở runner và app.
