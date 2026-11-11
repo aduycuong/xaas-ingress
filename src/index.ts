@@ -27,7 +27,7 @@ type Sql = NeonQueryFunction<false, false>;
 const MAX_BODY_BYTES = 256 * 1024;
 
 /** Route of the runner. A runner change that reorders or renames steps comes with a new route. */
-const RUNNER_ROUTE = "/run/v1";
+const RUNNER_ROUTE = "/run/v2";
 
 function uuidv7(now: number = Date.now()): string {
   const bytes = new Uint8Array(16);
