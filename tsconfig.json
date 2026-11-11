@@ -12,7 +12,8 @@
     "isolatedModules": true,
     "esModuleInterop": true,
     "types": [
-      "@cloudflare/workers-types"
+      "@cloudflare/workers-types",
+      "node"
     ]
   },
   "include": [
