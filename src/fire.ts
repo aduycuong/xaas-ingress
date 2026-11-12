@@ -107,7 +107,7 @@ export async function fireTrigger(sql: Sql, env: Bindings, trigger: TriggerRow, 
   }
 
   // The raw call: what `{{ trigger… }}` reads in the filter, the mapping and (stored with the run) the workflow.
-  const triggerData: CallParts = { body: call.body, headers: call.headers ? safeHeaders(call.headers) : {}, query: call.query ?? {}, ...(call.source === "schedule" ? { scheduledAt: new Date().toISOString() } : {}) };
+  const triggerData: CallParts = { body: call.body, headers: call.headers ? safeHeaders(call.headers) : {}, query: call.query ?? {}, ...(trigger.type === "cron" ? { scheduledAt: new Date().toISOString() } : {}) };
   const scope = callScope(triggerData);
   if (call.source !== "api" && call.source !== "schedule" && !passesFilter(trigger.filter, scope)) return reject("filter_not_matched", 422);
 
