@@ -17,7 +17,6 @@ export type TriggerRow = {
   concurrency_policy: "parallel" | "skip" | "queue";
   concurrency_max: number;
   rate_limit_per_minute: number | null;
-  skip_next: boolean;
   workflow_status: string;
   current_version_id: string | null;
 };
@@ -25,12 +24,12 @@ export type TriggerRow = {
 export type FireOutcome =
   | { kind: "started"; runId: string; no: number; queued: boolean }
   | { kind: "rejected"; reason: "invalid_signature" | "missing_auth" | "filter_not_matched" | "rate_limited"; status: 401 | 422 | 429 }
-  | { kind: "skipped"; reason: "trigger_disabled" | "workflow_not_active" | "skip_once" | "already_running" | "loop_detected" };
+  | { kind: "skipped"; reason: "trigger_disabled" | "workflow_not_active" | "already_running" | "loop_detected" };
 
 export async function loadTriggerById(sql: Sql, id: string): Promise<TriggerRow | null> {
   const [row] = await sql`
     select t.id, t.type, t.enabled, t.workspace_id, t.workflow_id, t.auth_mode, t.auth_secret, t.filter, t.input_mapping,
-      t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, t.skip_next, w.status as workflow_status, w.current_version_id
+      t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, w.status as workflow_status, w.current_version_id
     from triggers t join workflows w on w.id = t.workflow_id where t.id = ${id}::uuid`;
   return (row as TriggerRow | undefined) ?? null;
 }
@@ -38,7 +37,7 @@ export async function loadTriggerById(sql: Sql, id: string): Promise<TriggerRow 
 export async function loadTriggerByToken(sql: Sql, token: string): Promise<TriggerRow | null> {
   const [row] = await sql`
     select t.id, t.type, t.enabled, t.workspace_id, t.workflow_id, t.auth_mode, t.auth_secret, t.filter, t.input_mapping,
-      t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, t.skip_next, w.status as workflow_status, w.current_version_id
+      t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, w.status as workflow_status, w.current_version_id
     from triggers t join workflows w on w.id = t.workflow_id
     where t.webhook_token = ${token} and t.type in ('webhook', 'manual')`;
   return (row as TriggerRow | undefined) ?? null;
@@ -78,7 +77,7 @@ export type Call = {
 };
 
 /**
- * Everything after authentication: enabled, workflow active, skip-once, rate limit, filter, input
+ * Everything after authentication: enabled, workflow active, rate limit, filter, input
  * mapping, then the run under the concurrency policy. Every outcome is recorded.
  */
 export async function fireTrigger(sql: Sql, env: Bindings, trigger: TriggerRow, call: Call): Promise<FireOutcome> {
@@ -93,10 +92,6 @@ export async function fireTrigger(sql: Sql, env: Bindings, trigger: TriggerRow, 
 
   if (!trigger.enabled) return skip("trigger_disabled");
   if (trigger.workflow_status !== "active" || !trigger.current_version_id) return skip("workflow_not_active");
-  if (call.source === "schedule" && trigger.skip_next) {
-    await sql`update triggers set skip_next = false where id = ${trigger.id}::uuid`;
-    return skip("skip_once");
-  }
 
   const http = call.source === "webhook";
   if (http && trigger.rate_limit_per_minute) {

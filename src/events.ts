@@ -26,7 +26,7 @@ export async function handleRunFinished(sql: Sql, env: Bindings, runId: string):
 
   const triggers = (await sql`
     select t.id, t.type, t.enabled, t.workspace_id, t.workflow_id, t.auth_mode, t.auth_secret, t.filter, t.input_mapping,
-      t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, t.skip_next, w.status as workflow_status, w.current_version_id
+      t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, w.status as workflow_status, w.current_version_id
     from triggers t join workflows w on w.id = t.workflow_id
     where t.workspace_id = ${run.workspace_id}::uuid and t.type = 'event' and t.enabled
       and t.event_type = ${`run.${run.status}`} and (t.event_workflow_id is null or t.event_workflow_id = ${run.workflow_id}::uuid)`) as unknown as TriggerRow[];

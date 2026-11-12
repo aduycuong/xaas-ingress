@@ -165,4 +165,4 @@ Ingress nghe ở cổng 8788.
 | `POST /dispatch-queued` | Sweep của app: khởi động run đang xếp hàng khi trigger còn slot | Bearer `INGRESS_API_TOKEN` |
 | `POST /runs` | Chạy workflow từ app | Bearer `INGRESS_API_TOKEN` |
 
-Mỗi lượt gọi trigger qua các bước: bật, workflow `active`, skip-once (schedule), rate limit, filter, input mapping, rồi chính sách concurrency; mọi kết quả ghi vào `trigger_events`. Secret HMAC / bearer lưu mã hóa; Worker cần secret `TRIGGERS_ENCRYPTION_KEY` (cùng giá trị với app). `src/graph.ts` giống từng byte với bản ở runner và app.
+Mỗi lượt gọi trigger qua các bước: bật, workflow `active`, rate limit, filter, input mapping, rồi chính sách concurrency; mọi kết quả ghi vào `trigger_events`. Secret HMAC / bearer lưu mã hóa; Worker cần secret `TRIGGERS_ENCRYPTION_KEY` (cùng giá trị với app). `src/graph.ts` giống từng byte với bản ở runner và app.
