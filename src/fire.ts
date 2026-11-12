@@ -1,7 +1,7 @@
 // Firing a trigger: the checks every call goes through, in order, and a record of what happened.
 
 import { decryptSecret } from "./crypto";
-import { type Bindings, type Sql, startRun, uuidv7 } from "./runs";
+import { type Bindings, type Sql, environmentExists, startRun, uuidv7 } from "./runs";
 import { buildInput, callScope, checkAuth, passesFilter, safeHeaders, type AuthMode, type CallParts, type Filter } from "./webhook";
 
 export type TriggerRow = {
@@ -17,19 +17,21 @@ export type TriggerRow = {
   concurrency_policy: "parallel" | "skip" | "queue";
   concurrency_max: number;
   rate_limit_per_minute: number | null;
+  /** Environment of the runs it starts; ignored for `manual` (the caller chooses). */
+  env: string | null;
   workflow_status: string;
   current_version_id: string | null;
 };
 
 export type FireOutcome =
   | { kind: "started"; runId: string; no: number; queued: boolean }
-  | { kind: "rejected"; reason: "invalid_signature" | "missing_auth" | "filter_not_matched" | "rate_limited"; status: 401 | 422 | 429 }
+  | { kind: "rejected"; reason: "invalid_signature" | "missing_auth" | "filter_not_matched" | "rate_limited" | "unknown_environment"; status: 401 | 422 | 429 }
   | { kind: "skipped"; reason: "trigger_disabled" | "workflow_not_active" | "already_running" | "loop_detected" };
 
 export async function loadTriggerById(sql: Sql, id: string): Promise<TriggerRow | null> {
   const [row] = await sql`
     select t.id, t.type, t.enabled, t.workspace_id, t.workflow_id, t.auth_mode, t.auth_secret, t.filter, t.input_mapping,
-      t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, w.status as workflow_status, w.current_version_id
+      t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, t.env, w.status as workflow_status, w.current_version_id
     from triggers t join workflows w on w.id = t.workflow_id where t.id = ${id}::uuid`;
   return (row as TriggerRow | undefined) ?? null;
 }
@@ -37,7 +39,7 @@ export async function loadTriggerById(sql: Sql, id: string): Promise<TriggerRow 
 export async function loadTriggerByToken(sql: Sql, token: string): Promise<TriggerRow | null> {
   const [row] = await sql`
     select t.id, t.type, t.enabled, t.workspace_id, t.workflow_id, t.auth_mode, t.auth_secret, t.filter, t.input_mapping,
-      t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, w.status as workflow_status, w.current_version_id
+      t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, t.env, w.status as workflow_status, w.current_version_id
     from triggers t join workflows w on w.id = t.workflow_id
     where t.webhook_token = ${token} and t.type in ('webhook', 'manual')`;
   return (row as TriggerRow | undefined) ?? null;
@@ -74,6 +76,8 @@ export type Call = {
   source: "webhook" | "schedule" | "api" | "event";
   triggeredBy?: string | null;
   causeRunId?: string | null;
+  /** The environment a manual trigger's caller asked for (`?env=` or `env` in "Fire now"); other triggers use their own. */
+  env?: string | null;
 };
 
 /**
@@ -101,6 +105,10 @@ export async function fireTrigger(sql: Sql, env: Bindings, trigger: TriggerRow, 
     if (Number(recent?.n ?? 0) >= trigger.rate_limit_per_minute) return reject("rate_limited", 429);
   }
 
+  // A manual trigger runs where the caller asks (production by default); the others where they are set.
+  const runEnv = trigger.type === "manual" ? (call.env || "production") : (trigger.env || "production");
+  if (trigger.type === "manual" && call.env && !(await environmentExists(sql, trigger.workspace_id, call.env))) return reject("unknown_environment", 422);
+
   // The raw call: what `{{ trigger… }}` reads in the filter, the mapping and (stored with the run) the workflow.
   const triggerData: CallParts = { body: call.body, headers: call.headers ? safeHeaders(call.headers) : {}, query: call.query ?? {}, ...(trigger.type === "cron" ? { scheduledAt: new Date().toISOString() } : {}) };
   const scope = callScope(triggerData);
@@ -118,6 +126,7 @@ export async function fireTrigger(sql: Sql, env: Bindings, trigger: TriggerRow, 
     triggerData: triggerData as unknown as Record<string, unknown>,
     triggeredBy: call.triggeredBy ?? null,
     causeRunId: call.causeRunId ?? null,
+    env: runEnv,
     concurrency: { triggerId: trigger.id, policy: trigger.concurrency_policy, max: trigger.concurrency_policy === "parallel" ? trigger.concurrency_max : 1 },
   });
   if (!inserted) return skip("already_running");
