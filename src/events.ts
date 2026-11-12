@@ -16,9 +16,10 @@ export function chainBlocks(chain: { workflow_id: string }[], targetWorkflowId: 
 
 export async function handleRunFinished(sql: Sql, env: Bindings, runId: string): Promise<{ queuedStarted: number; fired: number; blocked: number }> {
   const [run] = await sql`
-    select r.id, r.no, r.status, r.error, r.workspace_id, r.workflow_id, r.trigger_id, w.slug as workflow_slug, w.name as workflow_name
+    select r.id, r.no, r.status, r.error, r.test, r.workspace_id, r.workflow_id, r.trigger_id, w.slug as workflow_slug, w.name as workflow_name
     from runs r join workflows w on w.id = r.workflow_id where r.id = ${runId}::uuid`;
-  if (!run) return { queuedStarted: 0, fired: 0, blocked: 0 };
+  // A run started from the editor takes no slot and fires no event trigger.
+  if (!run || run.test) return { queuedStarted: 0, fired: 0, blocked: 0 };
 
   const queuedStarted = run.trigger_id ? await dispatchQueued(sql, env, run.trigger_id) : 0;
   if (run.status !== "succeeded" && run.status !== "failed") return { queuedStarted, fired: 0, blocked: 0 };

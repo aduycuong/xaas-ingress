@@ -49,6 +49,17 @@ test("input mapping: values from body, headers and query; without a mapping the 
   assert.deepEqual(buildInput({}, scope(body), body), body);
 });
 
+test("input mapping: fixed values keep their type (text, number, boolean, JSON), also for a schedule with no body", () => {
+  const mapping = { page: "A", limit: 50, dry: false, tags: ["x", "y"], zero: 0, empty: "", at: "{{ trigger.scheduledAt }}", nope: "{{ trigger.body.nope }}" };
+  const call = callScope({ body: {}, headers: {}, query: {}, scheduledAt: "2026-11-12T08:00:00.000Z" });
+  const input = buildInput(mapping, call, {});
+  assert.deepEqual(input, { page: "A", limit: 50, dry: false, tags: ["x", "y"], zero: 0, empty: "", at: "2026-11-12T08:00:00.000Z" });
+  assert.equal(typeof input.limit, "number");
+  assert.equal(typeof input.dry, "boolean");
+  // A schedule with no mapping has an empty input.
+  assert.deepEqual(buildInput(null, call, {}), {});
+});
+
 test("credentials never reach the filter scope", () => {
   const headers = safeHeaders(new Headers({ Authorization: "Bearer x", "X-XaaS-Signature": "sha256=1", "X-Event": "post", Cookie: "a=b" }));
   assert.deepEqual(headers, { "x-event": "post" });

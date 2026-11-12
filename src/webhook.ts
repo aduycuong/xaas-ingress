@@ -20,11 +20,12 @@ export async function checkAuth(params: { mode: AuthMode; secret: string | null;
   return sameSecret(given.trim().toLowerCase(), await signBody(params.secret, params.rawBody)) ? null : "invalid_signature";
 }
 
-export type CallParts = { body: unknown; headers: Record<string, string>; query: Record<string, string> };
+/** The raw data of a call, as `{{ trigger… }}` reads it. A schedule adds `scheduledAt` (the time it fired, ISO). */
+export type CallParts = { body: unknown; headers: Record<string, string>; query: Record<string, string>; scheduledAt?: string };
 
-/** What filters and mappings read: `{{ trigger.body… }}`, `{{ trigger.headers… }}`, `{{ trigger.query… }}`. Header names are lower case. */
+/** What filters and mappings read: `{{ trigger.body… }}`, `{{ trigger.headers… }}`, `{{ trigger.query… }}`, `{{ trigger.scheduledAt }}`. Header names are lower case. There is no `input` yet: the mapping makes it. */
 export function callScope(parts: CallParts): Scope {
-  return { trigger: parts, run: { id: "", no: null, env: "production" }, nodes: {} };
+  return { input: undefined, trigger: parts, run: { id: "", no: null, env: "production" }, nodes: {} };
 }
 
 export type Filter = { join: "and" | "or"; conditions: { left: unknown; op: IfNode["data"]["conditions"][number]["op"]; right?: unknown }[] };
@@ -36,7 +37,10 @@ export function passesFilter(filter: Filter | null | undefined, scope: Scope): b
   return evaluateIf(node, scope) === "true";
 }
 
-/** The run input: each mapped value (a literal or a `{{ expression }}`) resolved against the call; without a mapping, the body. */
+/**
+ * The run input: each mapped value resolved against the call; without a mapping, the body. A mapped value is a typed literal
+ * (text, number, boolean or JSON, kept as stored) or, for a string with `{{ … }}`, an expression.
+ */
 export function buildInput(mapping: Record<string, unknown> | null | undefined, scope: Scope, body: Record<string, unknown>): Record<string, unknown> {
   if (!mapping || Object.keys(mapping).length === 0) return body;
   const out: Record<string, unknown> = {};

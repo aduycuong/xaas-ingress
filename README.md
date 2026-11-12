@@ -7,6 +7,8 @@ Worker cửa vào của XaaS Workflows: mọi cách khởi động một run t�
 | `POST /wh/<token>` | Hệ thống bên ngoài, cho trigger loại `webhook` | Token trong URL |
 | `POST /internal/triggers/<id>/fire` | QStash Schedule, cho trigger loại `cron` | Chữ ký Upstash (signing keys) |
 | `POST /runs` | App `xaas-workflows`, khi người dùng bấm Run | Bearer `INGRESS_API_TOKEN` |
+
+Body của `POST /runs` có thể kèm `test` (`{}` hoặc `{ nodeId, outputs }`) cùng `workflowVersionId` của bản **nháp**: đó là run thử từ editor (`env` luôn là `staging`, workflow không cần đã publish, không vào Runs, không phát sự kiện).
 | `GET /health` | Uptime monitor | Không |
 
 Toàn bộ code nằm trong `src/index.ts`.
