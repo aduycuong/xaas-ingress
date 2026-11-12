@@ -52,7 +52,8 @@ export type NewRun = {
   triggeredBy?: string | null;
   retryOf?: string | null;
   causeRunId?: string | null;
-  env?: "production" | "staging";
+  /** An environment of the workspace (`environmentExists`); `production` when left out. */
+  env?: string;
   /** A run started from the editor on the draft (`runs.test`). */
   test?: { nodeId?: string; outputs?: Record<string, unknown> } | null;
   /** The trigger's policy. Without it (a run started from the app) the run takes no slot and starts at once. */
@@ -60,6 +61,18 @@ export type NewRun = {
 };
 
 export type InsertedRun = { runId: string; no: number; dispatched: boolean };
+
+/** Environments every workspace has without an `environments` row (`builtInEnvironments` in the app's db/schema.ts). */
+export const BUILT_IN_ENVIRONMENTS = ["production", "staging"];
+const ENVIRONMENT_NAME = /^[a-z][a-z0-9-]{0,31}$/;
+
+/** True when `name` is an environment of the workspace: a built-in one, or one its members added. */
+export async function environmentExists(sql: Sql, workspaceId: string, name: string): Promise<boolean> {
+  if (BUILT_IN_ENVIRONMENTS.includes(name)) return true;
+  if (!ENVIRONMENT_NAME.test(name)) return false;
+  const [row] = await sql`select 1 as ok from environments where workspace_id = ${workspaceId}::uuid and name = ${name}`;
+  return Boolean(row);
+}
 
 /**
  * Creates the run row. With a concurrency policy the slot is taken in the same statement: a run

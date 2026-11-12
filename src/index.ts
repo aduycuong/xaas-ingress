@@ -13,7 +13,7 @@ import { Hono } from "hono";
 import { sameSecret } from "./crypto";
 import { handleRunFinished } from "./events";
 import { authenticate, fireTrigger, loadTriggerById, loadTriggerByToken, logTriggerEvent, type FireOutcome } from "./fire";
-import { dispatchQueued, startRun, type Bindings } from "./runs";
+import { dispatchQueued, environmentExists, startRun, type Bindings } from "./runs";
 
 /** Largest request body accepted. The body becomes the run input. */
 const MAX_BODY_BYTES = 256 * 1024;
@@ -93,7 +93,8 @@ app.post("/wh/:token", async (c) => {
   if (!body.ok) return c.json({ error: body.error }, body.status);
 
   const query = Object.fromEntries(new URL(c.req.url).searchParams);
-  const outcome = await fireTrigger(sql, c.env, trigger, { body: body.value, headers: c.req.raw.headers, query, source: "webhook" });
+  // A manual trigger may name its environment: `?env=staging`.
+  const outcome = await fireTrigger(sql, c.env, trigger, { body: body.value, headers: c.req.raw.headers, query, source: "webhook", env: trigger.type === "manual" ? (query.env ?? null) : null });
   const { body: out, status } = answer(outcome);
   return c.json(out, status);
 });
@@ -136,7 +137,8 @@ app.post("/triggers/:id/fire", async (c) => {
   const sql = neon(c.env.DATABASE_URL);
   const trigger = await loadTriggerById(sql, triggerId);
   if (!trigger) return c.json({ error: "not_found" }, 404);
-  const { body: out, status } = answer(await fireTrigger(sql, c.env, trigger, { body: input, source: "api", triggeredBy }));
+  const env = typeof body.value.env === "string" && body.value.env ? body.value.env : null;
+  const { body: out, status } = answer(await fireTrigger(sql, c.env, trigger, { body: input, source: "api", triggeredBy, env }));
   return c.json(out, status);
 });
 
@@ -175,12 +177,13 @@ app.post("/runs", async (c) => {
   const test = body.value.test ?? null;
   if (test !== null && (!isRecord(test) || (test.nodeId !== undefined && typeof test.nodeId !== "string") || (test.outputs !== undefined && !isRecord(test.outputs)))) return c.json({ error: "test_must_be_an_object" }, 400);
   if (test && !versionId) return c.json({ error: "test_needs_a_draft_version" }, 400);
-  const env = test ? "staging" : (body.value.env ?? "production");
-  if (env !== "production" && env !== "staging") return c.json({ error: "env_must_be_production_or_staging" }, 400);
+  // Tests in the editor default to staging, every other run to production; any environment of the workspace may be asked for.
+  const env = typeof body.value.env === "string" && body.value.env ? body.value.env : test ? "staging" : "production";
 
   const sql = neon(c.env.DATABASE_URL);
   const [workflow] = await sql`select workspace_id, current_version_id from workflows where id = ${workflowId}`;
   if (!workflow) return c.json({ error: "not_found" }, 404);
+  if (!(await environmentExists(sql, workflow.workspace_id, env))) return c.json({ error: "unknown_environment" }, 400);
   if (!workflow.current_version_id && !test) return c.json({ error: "workflow_not_published" }, 409);
   if (versionId) {
     const [version] = await sql`select 1 as ok from workflow_versions where id = ${versionId} and workflow_id = ${workflowId} and status = ${test ? "draft" : "published"}`;
