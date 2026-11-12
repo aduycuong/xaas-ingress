@@ -161,6 +161,9 @@ app.post("/runs", async (c) => {
   const input = body.value.input ?? {};
   if (typeof workflowId !== "string" || !UUID.test(workflowId)) return c.json({ error: "workflowId_must_be_a_uuid" }, 400);
   if (!isRecord(input)) return c.json({ error: "input_must_be_a_json_object" }, 400);
+  // The raw call data a test run of the editor gives to `{{ trigger… }}` (a real run from the app has none); optional.
+  const triggerData = body.value.triggerData ?? null;
+  if (triggerData !== null && !isRecord(triggerData)) return c.json({ error: "triggerData_must_be_a_json_object" }, 400);
 
   // Who started it, which run it repeats, which environment and (to repeat a run) which version; all optional.
   const optionalUuid = (value: unknown) => (typeof value === "string" && UUID.test(value) ? value : value === undefined || value === null ? null : false);
@@ -168,15 +171,19 @@ app.post("/runs", async (c) => {
   const retryOf = optionalUuid(body.value.retryOf);
   const versionId = optionalUuid(body.value.workflowVersionId);
   if (triggeredBy === false || retryOf === false || versionId === false) return c.json({ error: "ids_must_be_uuids" }, 400);
-  const env = body.value.env ?? "production";
+  // A test run of the draft (from the editor): `{ nodeId?, outputs? }`. It uses a draft version, so the workflow need not be published.
+  const test = body.value.test ?? null;
+  if (test !== null && (!isRecord(test) || (test.nodeId !== undefined && typeof test.nodeId !== "string") || (test.outputs !== undefined && !isRecord(test.outputs)))) return c.json({ error: "test_must_be_an_object" }, 400);
+  if (test && !versionId) return c.json({ error: "test_needs_a_draft_version" }, 400);
+  const env = test ? "staging" : (body.value.env ?? "production");
   if (env !== "production" && env !== "staging") return c.json({ error: "env_must_be_production_or_staging" }, 400);
 
   const sql = neon(c.env.DATABASE_URL);
   const [workflow] = await sql`select workspace_id, current_version_id from workflows where id = ${workflowId}`;
   if (!workflow) return c.json({ error: "not_found" }, 404);
-  if (!workflow.current_version_id) return c.json({ error: "workflow_not_published" }, 409);
+  if (!workflow.current_version_id && !test) return c.json({ error: "workflow_not_published" }, 409);
   if (versionId) {
-    const [version] = await sql`select 1 as ok from workflow_versions where id = ${versionId} and workflow_id = ${workflowId} and status = 'published'`;
+    const [version] = await sql`select 1 as ok from workflow_versions where id = ${versionId} and workflow_id = ${workflowId} and status = ${test ? "draft" : "published"}`;
     if (!version) return c.json({ error: "version_not_found" }, 404);
   }
 
@@ -184,9 +191,11 @@ app.post("/runs", async (c) => {
     workspaceId: workflow.workspace_id,
     workflowId,
     workflowVersionId: versionId ?? workflow.current_version_id,
+    test: test as { nodeId?: string; outputs?: Record<string, unknown> } | null,
     triggerId: null,
     triggerType: retryOf ? "retry" : "manual",
     input,
+    triggerData,
     triggeredBy,
     retryOf,
     env,

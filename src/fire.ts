@@ -2,7 +2,7 @@
 
 import { decryptSecret } from "./crypto";
 import { type Bindings, type Sql, startRun, uuidv7 } from "./runs";
-import { buildInput, callScope, checkAuth, passesFilter, safeHeaders, type AuthMode, type Filter } from "./webhook";
+import { buildInput, callScope, checkAuth, passesFilter, safeHeaders, type AuthMode, type CallParts, type Filter } from "./webhook";
 
 export type TriggerRow = {
   id: string;
@@ -106,10 +106,13 @@ export async function fireTrigger(sql: Sql, env: Bindings, trigger: TriggerRow, 
     if (Number(recent?.n ?? 0) >= trigger.rate_limit_per_minute) return reject("rate_limited", 429);
   }
 
-  const scope = callScope({ body: call.body, headers: call.headers ? safeHeaders(call.headers) : {}, query: call.query ?? {} });
+  // The raw call: what `{{ trigger… }}` reads in the filter, the mapping and (stored with the run) the workflow.
+  const triggerData: CallParts = { body: call.body, headers: call.headers ? safeHeaders(call.headers) : {}, query: call.query ?? {}, ...(call.source === "schedule" ? { scheduledAt: new Date().toISOString() } : {}) };
+  const scope = callScope(triggerData);
   if (call.source !== "api" && call.source !== "schedule" && !passesFilter(trigger.filter, scope)) return reject("filter_not_matched", 422);
 
-  const input = call.source === "schedule" ? {} : buildInput(trigger.input_mapping, scope, call.body);
+  // The mapping makes the input for every kind of call; a schedule has no body, so only its fixed values and `scheduledAt` count.
+  const input = buildInput(trigger.input_mapping, scope, call.body);
   const inserted = await startRun(sql, env, {
     workspaceId: trigger.workspace_id,
     workflowId: trigger.workflow_id,
@@ -117,6 +120,7 @@ export async function fireTrigger(sql: Sql, env: Bindings, trigger: TriggerRow, 
     triggerId: trigger.id,
     triggerType: trigger.type === "cron" ? "cron" : trigger.type,
     input,
+    triggerData: triggerData as unknown as Record<string, unknown>,
     triggeredBy: call.triggeredBy ?? null,
     causeRunId: call.causeRunId ?? null,
     concurrency: { triggerId: trigger.id, policy: trigger.concurrency_policy, max: trigger.concurrency_policy === "parallel" ? trigger.concurrency_max : 1 },

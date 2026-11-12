@@ -47,10 +47,14 @@ export type NewRun = {
   triggerId: string | null;
   triggerType: "cron" | "webhook" | "manual" | "event" | "retry";
   input: Record<string, unknown>;
+  /** The raw call that started the run (`{{ trigger… }}`); none for a run started from the app. */
+  triggerData?: Record<string, unknown> | null;
   triggeredBy?: string | null;
   retryOf?: string | null;
   causeRunId?: string | null;
   env?: "production" | "staging";
+  /** A run started from the editor on the draft (`runs.test`). */
+  test?: { nodeId?: string; outputs?: Record<string, unknown> } | null;
   /** The trigger's policy. Without it (a run started from the app) the run takes no slot and starts at once. */
   concurrency?: { triggerId: string; policy: "parallel" | "skip" | "queue"; max: number };
 };
@@ -80,10 +84,10 @@ export async function insertRun(sql: Sql, run: NewRun): Promise<InsertedRun | nu
       ), counter as (
         update workspaces set run_counter = run_counter + 1 where id = ${run.workspaceId} and exists (select 1 from ok) returning run_counter
       )
-      insert into runs (id, no, workspace_id, workflow_id, workflow_version_id, trigger_id, trigger_type, input, triggered_by, retry_of, cause_run_id, env, dispatched_at)
+      insert into runs (id, no, workspace_id, workflow_id, workflow_version_id, trigger_id, trigger_type, input, trigger_data, triggered_by, retry_of, cause_run_id, env, test, dispatched_at)
       select ${runId}, counter.run_counter, ${run.workspaceId}, ${run.workflowId}, ${run.workflowVersionId}, ${run.triggerId}::uuid,
-        ${run.triggerType}, ${JSON.stringify(run.input)}::jsonb, ${run.triggeredBy ?? null}::uuid, ${run.retryOf ?? null}::uuid, ${run.causeRunId ?? null}::uuid,
-        ${run.env ?? "production"}, case when (select c from slots) < ${max}::int then now() end
+        ${run.triggerType}, ${JSON.stringify(run.input)}::jsonb, ${run.triggerData ? JSON.stringify(run.triggerData) : null}::jsonb, ${run.triggeredBy ?? null}::uuid, ${run.retryOf ?? null}::uuid, ${run.causeRunId ?? null}::uuid,
+        ${run.env ?? "production"}, ${run.test ? JSON.stringify(run.test) : null}::jsonb, case when (select c from slots) < ${max}::int then now() end
       from counter
       returning id, no, dispatched_at`,
   ]);
