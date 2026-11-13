@@ -12,6 +12,7 @@ import { Receiver } from "@upstash/qstash";
 import { Hono } from "hono";
 import { sameSecret } from "./crypto";
 import { handleRunFinished } from "./events";
+import { fileEvents, fireWithFile, handleFileEvent, type FileEvent } from "./file-events";
 import { authenticate, fireTrigger, loadTriggerById, loadTriggerByToken, logTriggerEvent, type FireOutcome } from "./fire";
 import { dispatchQueued, environmentExists, startRun, type Bindings } from "./runs";
 
@@ -123,6 +124,36 @@ app.post("/internal/events/run-finished", async (c) => {
   }
   if (typeof runId !== "string" || !UUID.test(runId)) return c.json({ error: "runId_must_be_a_uuid" }, 400);
   return c.json(await handleRunFinished(neon(c.env.DATABASE_URL), c.env, runId));
+});
+
+app.post("/internal/events/file", async (c) => {
+  const checked = await verifiedQstashBody(c);
+  if ("error" in checked) return c.json({ error: checked.error }, checked.status);
+  const body = parseJsonObject(checked.body);
+  if (!body.ok) return c.json({ error: body.error }, body.status);
+  const { fileId, event, causeRunId } = body.value;
+  if (typeof fileId !== "string" || !UUID.test(fileId)) return c.json({ error: "fileId_must_be_a_uuid" }, 400);
+  if (typeof event !== "string" || !(fileEvents as readonly string[]).includes(event)) return c.json({ error: "unknown_event" }, 400);
+  if (causeRunId != null && (typeof causeRunId !== "string" || !UUID.test(causeRunId))) return c.json({ error: "causeRunId_must_be_a_uuid" }, 400);
+  return c.json(await handleFileEvent(neon(c.env.DATABASE_URL), c.env, { fileId, event: event as FileEvent, causeRunId: (causeRunId as string | null) ?? null }));
+});
+
+app.post("/triggers/:id/fire-file", async (c) => {
+  if (!hasApiToken(c.env, c.req.header("authorization"))) return c.json({ error: "unauthorized" }, 401);
+  const triggerId = c.req.param("id");
+  if (!UUID.test(triggerId)) return c.json({ error: "trigger_id_must_be_a_uuid" }, 400);
+  const body = parseJsonObject(await c.req.text());
+  if (!body.ok) return c.json({ error: body.error }, body.status);
+  const fileId = body.value.fileId;
+  if (typeof fileId !== "string" || !UUID.test(fileId)) return c.json({ error: "fileId_must_be_a_uuid" }, 400);
+  const triggeredBy = typeof body.value.triggeredBy === "string" && UUID.test(body.value.triggeredBy) ? body.value.triggeredBy : null;
+  const sql = neon(c.env.DATABASE_URL);
+  const trigger = await loadTriggerById(sql, triggerId);
+  if (!trigger || trigger.type !== "event") return c.json({ error: "not_found" }, 404);
+  const outcome = await fireWithFile(sql, c.env, trigger, fileId, triggeredBy);
+  if (!outcome) return c.json({ error: "file_not_found" }, 404);
+  const { body: out, status } = answer(outcome);
+  return c.json(out, status);
 });
 
 app.post("/triggers/:id/fire", async (c) => {
