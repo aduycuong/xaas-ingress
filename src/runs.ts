@@ -52,6 +52,8 @@ export type NewRun = {
   triggeredBy?: string | null;
   retryOf?: string | null;
   causeRunId?: string | null;
+  /** The workspace file that fired it (`file.*` trigger). */
+  causeFileId?: string | null;
   /** An environment of the workspace (`environmentExists`); `production` when left out. */
   env?: string;
   /** A run started from the editor on the draft (`runs.test`). */
@@ -97,9 +99,9 @@ export async function insertRun(sql: Sql, run: NewRun): Promise<InsertedRun | nu
       ), counter as (
         update workspaces set run_counter = run_counter + 1 where id = ${run.workspaceId} and exists (select 1 from ok) returning run_counter
       )
-      insert into runs (id, no, workspace_id, workflow_id, workflow_version_id, trigger_id, trigger_type, input, trigger_data, triggered_by, retry_of, cause_run_id, env, test, dispatched_at)
+      insert into runs (id, no, workspace_id, workflow_id, workflow_version_id, trigger_id, trigger_type, input, trigger_data, triggered_by, retry_of, cause_run_id, cause_file_id, env, test, dispatched_at)
       select ${runId}, counter.run_counter, ${run.workspaceId}, ${run.workflowId}, ${run.workflowVersionId}, ${run.triggerId}::uuid,
-        ${run.triggerType}, ${JSON.stringify(run.input)}::jsonb, ${run.triggerData ? JSON.stringify(run.triggerData) : null}::jsonb, ${run.triggeredBy ?? null}::uuid, ${run.retryOf ?? null}::uuid, ${run.causeRunId ?? null}::uuid,
+        ${run.triggerType}, ${JSON.stringify(run.input)}::jsonb, ${run.triggerData ? JSON.stringify(run.triggerData) : null}::jsonb, ${run.triggeredBy ?? null}::uuid, ${run.retryOf ?? null}::uuid, ${run.causeRunId ?? null}::uuid, ${run.causeFileId ?? null}::uuid,
         ${run.env ?? "production"}, ${run.test ? JSON.stringify(run.test) : null}::jsonb, case when (select c from slots) < ${max}::int then now() end
       from counter
       returning id, no, dispatched_at`,
