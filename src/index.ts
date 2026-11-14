@@ -48,14 +48,8 @@ async function verifiedQstashBody(c: { env: Bindings; req: { header(name: string
   const signature = c.req.header("upstash-signature");
   if (!signature) return { error: "missing_signature", status: 401 };
   const body = await c.req.text();
-  // The keys of the previous QStash too, while moving to another one (schedules and messages already sent there).
-  const keySets = [[currentSigningKey, nextSigningKey], [c.env.QSTASH_PREVIOUS_CURRENT_SIGNING_KEY, c.env.QSTASH_PREVIOUS_NEXT_SIGNING_KEY]];
-  for (const [current, next] of keySets) {
-    if (!current || !next) continue;
-    const valid = await new Receiver({ currentSigningKey: current, nextSigningKey: next }).verify({ signature, body }).catch(() => false);
-    if (valid) return { body };
-  }
-  return { error: "invalid_signature", status: 401 };
+  const valid = await new Receiver({ currentSigningKey, nextSigningKey }).verify({ signature, body }).catch(() => false);
+  return valid ? { body } : { error: "invalid_signature", status: 401 };
 }
 
 function hasApiToken(env: Bindings, header: string | undefined): boolean {

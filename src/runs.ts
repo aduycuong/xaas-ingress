@@ -15,12 +15,6 @@ export type Bindings = {
   QSTASH_URL?: string;
   QSTASH_CURRENT_SIGNING_KEY?: string;
   QSTASH_NEXT_SIGNING_KEY?: string;
-  /** Signing keys of the QStash used before a move; accepted next to QSTASH_*_SIGNING_KEY until removed. */
-  QSTASH_PREVIOUS_CURRENT_SIGNING_KEY?: string;
-  QSTASH_PREVIOUS_NEXT_SIGNING_KEY?: string;
-  /** Optional QStash for workflow runs only (same values as in the runner); without them QSTASH_URL / QSTASH_TOKEN. */
-  WORKFLOW_QSTASH_URL?: string;
-  WORKFLOW_QSTASH_TOKEN?: string;
   /** Public URL of the runner Worker, without a trailing slash. */
   RUNNER_URL: string;
   /** Shared with the xaas-workflows app for `POST /runs` and the internal calls the app makes. */
@@ -122,9 +116,7 @@ export async function insertRun(sql: Sql, run: NewRun): Promise<InsertedRun | nu
 /** Starts the run on Upstash. If that fails the run is marked failed and the error is thrown. */
 export async function handToRunner(sql: Sql, env: Bindings, runId: string): Promise<void> {
   try {
-    const client = env.WORKFLOW_QSTASH_TOKEN
-      ? new Client({ token: env.WORKFLOW_QSTASH_TOKEN, baseUrl: env.WORKFLOW_QSTASH_URL || undefined })
-      : new Client({ token: env.QSTASH_TOKEN, baseUrl: env.QSTASH_URL || undefined });
+    const client = new Client({ token: env.QSTASH_TOKEN, baseUrl: env.QSTASH_URL || undefined });
     const { workflowRunId } = await client.trigger({
       url: `${env.RUNNER_URL.replace(/\/$/, "")}${RUNNER_ROUTE}`,
       workflowRunId: runId,
