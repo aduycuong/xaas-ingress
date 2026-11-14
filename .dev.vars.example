@@ -9,6 +9,9 @@ QSTASH_NEXT_SIGNING_KEY=
 # Optional QStash that workflow runs are started on (same as the runner).
 # WORKFLOW_QSTASH_URL=
 # WORKFLOW_QSTASH_TOKEN=
+# Signing keys of the previous QStash while moving to another one.
+# QSTASH_PREVIOUS_CURRENT_SIGNING_KEY=
+# QSTASH_PREVIOUS_NEXT_SIGNING_KEY=
 # Where Upstash reaches the runner Worker, without a trailing slash.
 RUNNER_URL=
 # Shared with the xaas-workflows app for POST /runs.

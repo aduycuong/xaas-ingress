@@ -15,6 +15,9 @@ export type Bindings = {
   QSTASH_URL?: string;
   QSTASH_CURRENT_SIGNING_KEY?: string;
   QSTASH_NEXT_SIGNING_KEY?: string;
+  /** Signing keys of the QStash used before a move; accepted next to QSTASH_*_SIGNING_KEY until removed. */
+  QSTASH_PREVIOUS_CURRENT_SIGNING_KEY?: string;
+  QSTASH_PREVIOUS_NEXT_SIGNING_KEY?: string;
   /** Optional QStash for workflow runs only (same values as in the runner); without them QSTASH_URL / QSTASH_TOKEN. */
   WORKFLOW_QSTASH_URL?: string;
   WORKFLOW_QSTASH_TOKEN?: string;

@@ -13,6 +13,6 @@
   // Optional: a Hyperdrive binding named HYPERDRIVE replaces DATABASE_URL (see the README of the workers folder).
   "vars": {
     "RUNNER_URL": "https://runner.xaas.im",
-    "QSTASH_URL": "https://qstash-us-east-1.upstash.io"
+    "QSTASH_URL": "https://qstash-eu-central-1.upstash.io"
   }
 }
