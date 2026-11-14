@@ -63,7 +63,8 @@ npx wrangler secret put INGRESS_API_TOKEN
 | `QSTASH_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY` | Upstash console, mục QStash; cùng tài khoản QStash với runner |
 | `INGRESS_API_TOKEN` | Tự sinh một chuỗi ngẫu nhiên dài; đặt cùng giá trị vào `.env` của app |
 | `QSTASH_URL` (tùy chọn) | Chỉ khi QStash của bạn không ở endpoint mặc định (theo vùng) |
-| `WORKFLOW_QSTASH_URL`, `WORKFLOW_QSTASH_TOKEN` (tùy chọn) | QStash dùng để bắt đầu workflow run (hiện là EU), cùng giá trị với runner. Không có thì dùng `QSTASH_*`. Chữ ký của schedule và event vẫn kiểm bằng `QSTASH_*_SIGNING_KEY` |
+| `WORKFLOW_QSTASH_URL`, `WORKFLOW_QSTASH_TOKEN` (tùy chọn) | QStash riêng để bắt đầu workflow run, cùng giá trị với runner. Không có thì dùng `QSTASH_*` (hiện tất cả ở EU `eu-central-1`, nên không đặt) |
+| `QSTASH_PREVIOUS_CURRENT_SIGNING_KEY`, `QSTASH_PREVIOUS_NEXT_SIGNING_KEY` (tùy chọn) | Signing key của QStash cũ khi chuyển sang QStash khác: chữ ký của cả hai được nhận cho tới khi xoá hai secret này |
 
 4. Deploy:
 
