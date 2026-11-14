@@ -1,17 +1,23 @@
 // Creating runs and handing them to the runner. A trigger's concurrency policy is applied here,
 // under a per-trigger advisory lock, so two calls at the same moment cannot both take the last slot.
 
-import { type NeonQueryFunction } from "@neondatabase/serverless";
 import { Client } from "@upstash/workflow";
+import type { Sql } from "./db";
 
-export type Sql = NeonQueryFunction<false, false>;
+export type { Sql };
 
 export type Bindings = {
-  DATABASE_URL: string;
+  /** Direct database URL; not needed when the HYPERDRIVE binding is set. */
+  DATABASE_URL?: string;
+  /** Optional Hyperdrive in front of the database: warm connections near the Worker. */
+  HYPERDRIVE?: Hyperdrive;
   QSTASH_TOKEN: string;
   QSTASH_URL?: string;
   QSTASH_CURRENT_SIGNING_KEY?: string;
   QSTASH_NEXT_SIGNING_KEY?: string;
+  /** Optional QStash for workflow runs only (same values as in the runner); without them QSTASH_URL / QSTASH_TOKEN. */
+  WORKFLOW_QSTASH_URL?: string;
+  WORKFLOW_QSTASH_TOKEN?: string;
   /** Public URL of the runner Worker, without a trailing slash. */
   RUNNER_URL: string;
   /** Shared with the xaas-workflows app for `POST /runs` and the internal calls the app makes. */
@@ -113,7 +119,9 @@ export async function insertRun(sql: Sql, run: NewRun): Promise<InsertedRun | nu
 /** Starts the run on Upstash. If that fails the run is marked failed and the error is thrown. */
 export async function handToRunner(sql: Sql, env: Bindings, runId: string): Promise<void> {
   try {
-    const client = new Client({ token: env.QSTASH_TOKEN, baseUrl: env.QSTASH_URL || undefined });
+    const client = env.WORKFLOW_QSTASH_TOKEN
+      ? new Client({ token: env.WORKFLOW_QSTASH_TOKEN, baseUrl: env.WORKFLOW_QSTASH_URL || undefined })
+      : new Client({ token: env.QSTASH_TOKEN, baseUrl: env.QSTASH_URL || undefined });
     const { workflowRunId } = await client.trigger({
       url: `${env.RUNNER_URL.replace(/\/$/, "")}${RUNNER_ROUTE}`,
       workflowRunId: runId,

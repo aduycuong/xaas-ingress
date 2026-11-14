@@ -7,10 +7,10 @@
 //   POST /runs                               manual run from the xaas-workflows app (bearer token)
 // Database access is plain SQL: the tables are owned and migrated by the xaas-workflows app.
 
-import { neon } from "@neondatabase/serverless";
 import { Receiver } from "@upstash/qstash";
 import { Hono } from "hono";
 import { sameSecret } from "./crypto";
+import { connect, databaseUrl, type Sql } from "./db";
 import { handleRunFinished } from "./events";
 import { fileEvents, fireWithFile, handleFileEvent, type FileEvent } from "./file-events";
 import { authenticate, fireTrigger, loadTriggerById, loadTriggerByToken, logTriggerEvent, type FireOutcome } from "./fire";
@@ -67,7 +67,18 @@ function answer(outcome: FireOutcome): { body: Record<string, unknown>; status: 
   return { body: { status: "skipped", reason: outcome.reason }, status: 409 };
 }
 
-const app = new Hono<{ Bindings: Bindings }>();
+const app = new Hono<{ Bindings: Bindings; Variables: { sql: Sql } }>();
+
+// One database handle per request, closed once the request is done (a Worker cannot reuse a socket across requests).
+app.use(async (c, next) => {
+  const sql = connect(databaseUrl(c.env));
+  c.set("sql", sql);
+  try {
+    await next();
+  } finally {
+    c.executionCtx.waitUntil(sql.end());
+  }
+});
 
 app.get("/health", (c) => c.json({ ok: true }));
 
@@ -78,7 +89,7 @@ app.onError((error, c) => {
 });
 
 app.post("/wh/:token", async (c) => {
-  const sql = neon(c.env.DATABASE_URL);
+  const sql = c.var.sql;
   const trigger = await loadTriggerByToken(sql, c.req.param("token"));
   if (!trigger) return c.json({ error: "not_found" }, 404);
 
@@ -106,7 +117,7 @@ app.post("/internal/triggers/:id/fire", async (c) => {
 
   const triggerId = c.req.param("id");
   if (!UUID.test(triggerId)) return c.json({ status: "not_found" });
-  const sql = neon(c.env.DATABASE_URL);
+  const sql = c.var.sql;
   const trigger = await loadTriggerById(sql, triggerId);
   // A trigger that is gone answers 200: a retry would not change the outcome.
   if (!trigger) return c.json({ status: "not_found" });
@@ -123,7 +134,7 @@ app.post("/internal/events/run-finished", async (c) => {
     return c.json({ error: "invalid_json" }, 400);
   }
   if (typeof runId !== "string" || !UUID.test(runId)) return c.json({ error: "runId_must_be_a_uuid" }, 400);
-  return c.json(await handleRunFinished(neon(c.env.DATABASE_URL), c.env, runId));
+  return c.json(await handleRunFinished(c.var.sql, c.env, runId));
 });
 
 app.post("/internal/events/file", async (c) => {
@@ -135,7 +146,7 @@ app.post("/internal/events/file", async (c) => {
   if (typeof fileId !== "string" || !UUID.test(fileId)) return c.json({ error: "fileId_must_be_a_uuid" }, 400);
   if (typeof event !== "string" || !(fileEvents as readonly string[]).includes(event)) return c.json({ error: "unknown_event" }, 400);
   if (causeRunId != null && (typeof causeRunId !== "string" || !UUID.test(causeRunId))) return c.json({ error: "causeRunId_must_be_a_uuid" }, 400);
-  return c.json(await handleFileEvent(neon(c.env.DATABASE_URL), c.env, { fileId, event: event as FileEvent, causeRunId: (causeRunId as string | null) ?? null }));
+  return c.json(await handleFileEvent(c.var.sql, c.env, { fileId, event: event as FileEvent, causeRunId: (causeRunId as string | null) ?? null }));
 });
 
 app.post("/triggers/:id/fire-file", async (c) => {
@@ -147,7 +158,7 @@ app.post("/triggers/:id/fire-file", async (c) => {
   const fileId = body.value.fileId;
   if (typeof fileId !== "string" || !UUID.test(fileId)) return c.json({ error: "fileId_must_be_a_uuid" }, 400);
   const triggeredBy = typeof body.value.triggeredBy === "string" && UUID.test(body.value.triggeredBy) ? body.value.triggeredBy : null;
-  const sql = neon(c.env.DATABASE_URL);
+  const sql = c.var.sql;
   const trigger = await loadTriggerById(sql, triggerId);
   if (!trigger || trigger.type !== "event") return c.json({ error: "not_found" }, 404);
   const outcome = await fireWithFile(sql, c.env, trigger, fileId, triggeredBy);
@@ -165,7 +176,7 @@ app.post("/triggers/:id/fire", async (c) => {
   const triggeredBy = typeof body.value.triggeredBy === "string" && UUID.test(body.value.triggeredBy) ? body.value.triggeredBy : null;
   const input = isRecord(body.value.input) ? body.value.input : {};
 
-  const sql = neon(c.env.DATABASE_URL);
+  const sql = c.var.sql;
   const trigger = await loadTriggerById(sql, triggerId);
   if (!trigger) return c.json({ error: "not_found" }, 404);
   const env = typeof body.value.env === "string" && body.value.env ? body.value.env : null;
@@ -175,7 +186,7 @@ app.post("/triggers/:id/fire", async (c) => {
 
 app.post("/dispatch-queued", async (c) => {
   if (!hasApiToken(c.env, c.req.header("authorization"))) return c.json({ error: "unauthorized" }, 401);
-  const sql = neon(c.env.DATABASE_URL);
+  const sql = c.var.sql;
   // Triggers with runs waiting for a slot.
   const waiting = (await sql`select distinct trigger_id from runs where status = 'queued' and dispatched_at is null and trigger_id is not null limit 200`) as unknown as { trigger_id: string }[];
   let started = 0;
@@ -211,7 +222,7 @@ app.post("/runs", async (c) => {
   // Tests in the editor default to staging, every other run to production; any environment of the workspace may be asked for.
   const env = typeof body.value.env === "string" && body.value.env ? body.value.env : test ? "staging" : "production";
 
-  const sql = neon(c.env.DATABASE_URL);
+  const sql = c.var.sql;
   const [workflow] = await sql`select workspace_id, current_version_id from workflows where id = ${workflowId}`;
   if (!workflow) return c.json({ error: "not_found" }, 404);
   if (!(await environmentExists(sql, workflow.workspace_id, env))) return c.json({ error: "unknown_environment" }, 400);
