@@ -59,10 +59,11 @@ npx wrangler secret put INGRESS_API_TOKEN
 
 | Secret | Lấy ở đâu |
 | --- | --- |
-| `DATABASE_URL` | Connection string của Neon, cùng database với app và runner |
+| `DATABASE_URL` | Connection string của PlanetScale Postgres, cùng database với app và runner; giữ `?sslmode=verify-full`, bỏ `sslrootcert` |
 | `QSTASH_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY` | Upstash console, mục QStash; cùng tài khoản QStash với runner |
 | `INGRESS_API_TOKEN` | Tự sinh một chuỗi ngẫu nhiên dài; đặt cùng giá trị vào `.env` của app |
 | `QSTASH_URL` (tùy chọn) | Chỉ khi QStash của bạn không ở endpoint mặc định (theo vùng) |
+| `WORKFLOW_QSTASH_URL`, `WORKFLOW_QSTASH_TOKEN` (tùy chọn) | QStash dùng để bắt đầu workflow run (hiện là EU), cùng giá trị với runner. Không có thì dùng `QSTASH_*`. Chữ ký của schedule và event vẫn kiểm bằng `QSTASH_*_SIGNING_KEY` |
 
 4. Deploy:
 

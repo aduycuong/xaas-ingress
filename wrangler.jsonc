@@ -5,8 +5,12 @@
   "compatibility_date": "2026-11-01",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
+  // Warm connections to PlanetScale (cache off); used instead of DATABASE_URL. See the README of the workers folder.
+  "hyperdrive": [{ "binding": "HYPERDRIVE", "id": "c524d196b04e409ea2ad8d9888cde6f9" }],
   // Secrets (wrangler secret put, or .dev.vars locally):
   //   DATABASE_URL, QSTASH_TOKEN, QSTASH_CURRENT_SIGNING_KEY, QSTASH_NEXT_SIGNING_KEY, INGRESS_API_TOKEN
+  // DATABASE_URL: PlanetScale Postgres, `?sslmode=verify-full` without `sslrootcert` (pg reads that as a file path).
+  // Optional: a Hyperdrive binding named HYPERDRIVE replaces DATABASE_URL (see the README of the workers folder).
   "vars": {
     "RUNNER_URL": "https://runner.xaas.im",
     "QSTASH_URL": "https://qstash-us-east-1.upstash.io"
