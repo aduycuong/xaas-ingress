@@ -5,12 +5,14 @@
 //   POST /triggers/:id/fire                  "Fire now" from the xaas-workflows app (bearer token)
 //   POST /dispatch-queued                    the app's sweep: start queued runs whose trigger has a free slot (bearer token)
 //   POST /runs                               manual run from the xaas-workflows app (bearer token)
+//   POST /callbacks/:nodeRunId/:attempt      result of an async node (signed URL the runner gave the node)
 // Database access is plain SQL: the tables are owned and migrated by the xaas-workflows app.
 
 import { Receiver } from "@upstash/qstash";
 import { Hono } from "hono";
 import { sameSecret } from "./crypto";
 import { connect, databaseUrl, type Sql } from "./db";
+import { handleCallback } from "./callbacks";
 import { handleRunFinished } from "./events";
 import { fileEvents, fireWithFile, handleFileEvent, type FileEvent } from "./file-events";
 import { authenticate, fireTrigger, loadTriggerById, loadTriggerByToken, logTriggerEvent, type FireOutcome } from "./fire";
@@ -182,6 +184,24 @@ app.post("/triggers/:id/fire", async (c) => {
   const env = typeof body.value.env === "string" && body.value.env ? body.value.env : null;
   const { body: out, status } = answer(await fireTrigger(sql, c.env, trigger, { body: input, source: "api", triggeredBy, env }));
   return c.json(out, status);
+});
+
+app.post("/callbacks/:nodeRunId/:attempt", async (c) => {
+  const nodeRunId = c.req.param("nodeRunId");
+  const attempt = Number(c.req.param("attempt"));
+  const exp = Number(c.req.query("exp"));
+  const sig = c.req.query("sig") ?? "";
+  if (!UUID.test(nodeRunId) || !Number.isInteger(attempt) || attempt < 1 || !Number.isInteger(exp) || !sig) return c.json({ error: "invalid_callback_url" }, 400);
+  const answer = await handleCallback(c.var.sql, c.env, {
+    nodeRunId,
+    attempt,
+    exp,
+    sig,
+    body: await c.req.text(),
+    contentType: c.req.header("content-type") ?? "",
+    headers: c.req.raw.headers,
+  });
+  return c.json(answer.body, answer.status);
 });
 
 app.post("/dispatch-queued", async (c) => {
