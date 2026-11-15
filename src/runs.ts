@@ -15,6 +15,8 @@ export type Bindings = {
   QSTASH_URL?: string;
   QSTASH_CURRENT_SIGNING_KEY?: string;
   QSTASH_NEXT_SIGNING_KEY?: string;
+  /** Signs the callback URLs of async nodes (the runner makes them, `POST /callbacks/...` checks them); same value as the runner. */
+  CALLBACK_SIGNING_KEY?: string;
   /** Public URL of the runner Worker, without a trailing slash. */
   RUNNER_URL: string;
   /** Shared with the xaas-workflows app for `POST /runs` and the internal calls the app makes. */
@@ -26,7 +28,7 @@ export type Bindings = {
 };
 
 /** Route of the runner. A runner change that reorders or renames steps comes with a new route. */
-const RUNNER_ROUTE = "/run/v3";
+const RUNNER_ROUTE = "/run/v4";
 
 export function uuidv7(now: number = Date.now()): string {
   const bytes = new Uint8Array(16);

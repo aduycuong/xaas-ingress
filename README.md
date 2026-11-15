@@ -62,6 +62,7 @@ npx wrangler secret put INGRESS_API_TOKEN
 | `DATABASE_URL` | Connection string của PlanetScale Postgres, cùng database với app và runner; giữ `?sslmode=verify-full`, bỏ `sslrootcert` |
 | `QSTASH_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY` | Upstash console, mục QStash; cùng tài khoản QStash với runner |
 | `INGRESS_API_TOKEN` | Tự sinh một chuỗi ngẫu nhiên dài; đặt cùng giá trị vào `.env` của app |
+| `CALLBACK_SIGNING_KEY` | Cùng giá trị với runner: kiểm `callback_url` của node Async (`POST /callbacks/:nodeRunId/:attempt`) |
 | `QSTASH_URL` (tùy chọn) | Chỉ khi QStash của bạn không ở endpoint mặc định (theo vùng) |
 
 4. Deploy:
@@ -116,7 +117,7 @@ npm run deploy
 
 - Deploy không gây gián đoạn và không ảnh hưởng tới run đang chạy: sau khi trigger, run chỉ còn đi giữa Upstash và runner.
 - Secret giữ nguyên qua các lần deploy; chỉ đặt lại khi đổi giá trị.
-- Khi runner có route mới (`/run/v3`), đổi hằng `RUNNER_ROUTE` trong `src/index.ts` rồi deploy lại; run mới sẽ đi vào route mới.
+- Khi runner có route mới (ví dụ `/run/v5`), đổi hằng `RUNNER_ROUTE` trong `src/runs.ts` rồi deploy lại; run mới sẽ đi vào route mới.
 
 ### Quay lại bản trước và xem log
 

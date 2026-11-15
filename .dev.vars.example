@@ -10,3 +10,5 @@ QSTASH_NEXT_SIGNING_KEY=
 RUNNER_URL=
 # Shared with the xaas-workflows app for POST /runs.
 INGRESS_API_TOKEN=
+# Checks the callback URLs of async nodes (same value as the runner).
+CALLBACK_SIGNING_KEY=
