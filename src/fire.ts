@@ -1,12 +1,14 @@
 // Firing a trigger: the checks every call goes through, in order, and a record of what happened.
 
 import { decryptSecret } from "./crypto";
+import { validateInput, type InputProblem } from "./input-schema";
 import { type Bindings, type Sql, environmentExists, startRun, uuidv7 } from "./runs";
 import { buildInput, callScope, checkAuth, passesFilter, safeHeaders, type AuthMode, type CallParts, type Filter } from "./webhook";
 
 export type TriggerRow = {
   id: string;
-  type: "cron" | "webhook" | "manual" | "event";
+  /** `manual` is the old name of `api`, until `scripts/migrate-api-trigger.ts` of the app has run. */
+  type: "cron" | "webhook" | "api" | "manual" | "event";
   enabled: boolean;
   workspace_id: string;
   workflow_id: string;
@@ -17,7 +19,7 @@ export type TriggerRow = {
   concurrency_policy: "parallel" | "skip" | "queue";
   concurrency_max: number;
   rate_limit_per_minute: number | null;
-  /** Environment of the runs it starts; ignored for `manual` (the caller chooses). */
+  /** Environment of the runs it starts; ignored for `api` (the caller chooses). */
   env: string | null;
   workflow_status: string;
   current_version_id: string | null;
@@ -28,6 +30,8 @@ export type TriggerRow = {
 export type FireOutcome =
   | { kind: "started"; runId: string; no: number; queued: boolean }
   | { kind: "rejected"; reason: "invalid_signature" | "missing_auth" | "filter_not_matched" | "rate_limited" | "unknown_environment"; status: 401 | 422 | 429 }
+  /** The input (after the mapping) does not fit the input schema of the published version. */
+  | { kind: "rejected"; reason: "invalid_input"; status: 422; problems: InputProblem[] }
   | { kind: "skipped"; reason: "trigger_disabled" | "workflow_not_active" | "already_running" | "loop_detected" };
 
 export async function loadTriggerById(sql: Sql, id: string): Promise<TriggerRow | null> {
@@ -43,9 +47,19 @@ export async function loadTriggerByToken(sql: Sql, token: string): Promise<Trigg
     select t.id, t.type, t.enabled, t.workspace_id, t.workflow_id, t.auth_mode, t.auth_secret, t.filter, t.input_mapping,
       t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, t.env, w.status as workflow_status, w.current_version_id
     from triggers t join workflows w on w.id = t.workflow_id
-    where t.webhook_token = ${token} and t.type in ('webhook', 'manual')`;
+    where t.webhook_token = ${token} and t.type in ('webhook', 'api', 'manual')`;
   return (row as TriggerRow | undefined) ?? null;
 }
+
+/** The input schema of a workflow version (`definition.inputSchema`), or null when it has none. */
+export async function inputSchemaOf(sql: Sql, versionId: string): Promise<Record<string, unknown> | null> {
+  const [row] = await sql`select definition->'inputSchema' as schema from workflow_versions where id = ${versionId}::uuid`;
+  const schema = (row as { schema?: unknown } | undefined)?.schema;
+  return schema && typeof schema === "object" && !Array.isArray(schema) ? (schema as Record<string, unknown>) : null;
+}
+
+/** An API trigger (`manual` is its old name): the caller sends the input and picks the environment. */
+export const isApiTrigger = (trigger: Pick<TriggerRow, "type">) => trigger.type === "api" || trigger.type === "manual";
 
 /** Records one call of a trigger: the run it started, or why it did not. Never throws: the record is not worth failing a call over. */
 export async function logTriggerEvent(sql: Sql, trigger: Pick<TriggerRow, "id" | "workspace_id">, outcome: "fired" | "rejected" | "skipped", reason: string | null, runId: string | null) {
@@ -80,7 +94,7 @@ export type Call = {
   causeRunId?: string | null;
   /** The workspace file that fired it (`file.*` trigger). */
   causeFileId?: string | null;
-  /** The environment a manual trigger's caller asked for (`?env=` or `env` in "Fire now"); other triggers use their own. */
+  /** The environment an API trigger's caller asked for (`?env=` or `env` in "Fire now"); other triggers use their own. */
   env?: string | null;
 };
 
@@ -93,7 +107,7 @@ export async function fireTrigger(sql: Sql, env: Bindings, trigger: TriggerRow, 
     await logTriggerEvent(sql, trigger, "skipped", reason, null);
     return { kind: "skipped", reason };
   };
-  const reject = async (reason: Extract<FireOutcome, { kind: "rejected" }>["reason"], status: 401 | 422 | 429): Promise<FireOutcome> => {
+  const reject = async (reason: Exclude<Extract<FireOutcome, { kind: "rejected" }>["reason"], "invalid_input">, status: 401 | 422 | 429): Promise<FireOutcome> => {
     await logTriggerEvent(sql, trigger, "rejected", reason, null);
     return { kind: "rejected", reason, status };
   };
@@ -109,9 +123,9 @@ export async function fireTrigger(sql: Sql, env: Bindings, trigger: TriggerRow, 
     if (Number(recent?.n ?? 0) >= trigger.rate_limit_per_minute) return reject("rate_limited", 429);
   }
 
-  // A manual trigger runs where the caller asks (production by default); the others where they are set.
-  const runEnv = trigger.type === "manual" ? (call.env || "production") : (trigger.env || "production");
-  if (trigger.type === "manual" && call.env && !(await environmentExists(sql, trigger.workspace_id, call.env))) return reject("unknown_environment", 422);
+  // An API trigger runs where the caller asks (production by default); the others where they are set.
+  const runEnv = isApiTrigger(trigger) ? (call.env || "production") : (trigger.env || "production");
+  if (isApiTrigger(trigger) && call.env && !(await environmentExists(sql, trigger.workspace_id, call.env))) return reject("unknown_environment", 422);
 
   // The raw call: what `{{ trigger… }}` reads in the filter, the mapping and (stored with the run) the workflow.
   const triggerData: CallParts = { body: call.body, headers: call.headers ? safeHeaders(call.headers) : {}, query: call.query ?? {}, ...(trigger.type === "cron" ? { scheduledAt: new Date().toISOString() } : {}) };
@@ -120,12 +134,19 @@ export async function fireTrigger(sql: Sql, env: Bindings, trigger: TriggerRow, 
 
   // The mapping makes the input for every kind of call; a schedule has no body, so only its fixed values and `scheduledAt` count.
   const input = buildInput(trigger.input_mapping, scope, call.body);
+
+  // Every trigger's input (webhook, API, event, schedule, "Fire now") must fit the input schema of the version that runs.
+  const problems = validateInput(await inputSchemaOf(sql, trigger.current_version_id), input);
+  if (problems.length) {
+    await logTriggerEvent(sql, trigger, "rejected", "invalid_input", null);
+    return { kind: "rejected", reason: "invalid_input", status: 422, problems };
+  }
   const inserted = await startRun(sql, env, {
     workspaceId: trigger.workspace_id,
     workflowId: trigger.workflow_id,
     workflowVersionId: trigger.current_version_id,
     triggerId: trigger.id,
-    triggerType: trigger.type === "cron" ? "cron" : trigger.type,
+    triggerType: isApiTrigger(trigger) ? "api" : trigger.type === "cron" ? "cron" : (trigger.type as "webhook" | "event"),
     input,
     triggerData: triggerData as unknown as Record<string, unknown>,
     triggeredBy: call.triggeredBy ?? null,

@@ -1,11 +1,14 @@
 // Ingress Worker: every way a run is started from outside goes through here.
-//   POST /wh/:token                          webhook or manual-API trigger (token in the URL, plus the trigger's own auth)
+//   POST /wh/:token                          webhook or API trigger (token in the URL, plus the trigger's own auth)
 //   POST /internal/triggers/:id/fire         QStash schedule of a cron trigger (Upstash signature)
 //   POST /internal/events/run-finished       QStash message from the runner when a run ends (Upstash signature)
 //   POST /triggers/:id/fire                  "Fire now" from the xaas-workflows app (bearer token)
 //   POST /dispatch-queued                    the app's sweep: start queued runs whose trigger has a free slot (bearer token)
 //   POST /runs                               manual run from the xaas-workflows app (bearer token)
 //   POST /callbacks/:nodeRunId/:attempt      result of an async node (signed URL the runner gave the node)
+//   POST /hooks/telegram/:botId              updates of a bot whose connection emits events (secret_token of setWebhook)
+//   GET  /hooks/facebook                     verification of the Facebook app's Page webhook (verify token)
+//   POST /hooks/facebook                     Page webhook deliveries: comments, Messenger, leads (X-Hub-Signature-256)
 // Database access is plain SQL: the tables are owned and migrated by the xaas-workflows app.
 
 import { Receiver } from "@upstash/qstash";
@@ -13,9 +16,10 @@ import { Hono } from "hono";
 import { sameSecret } from "./crypto";
 import { connect, databaseUrl, type Sql } from "./db";
 import { handleCallback } from "./callbacks";
+import { emitConnectionEvent, facebookEvents, facebookSignatureValid, learnTelegramChat, sha256Hex, telegramChatOf, telegramEvent, touchSubscription } from "./connection-events";
 import { handleRunFinished } from "./events";
 import { fileEvents, fireWithFile, handleFileEvent, type FileEvent } from "./file-events";
-import { authenticate, fireTrigger, loadTriggerById, loadTriggerByToken, logTriggerEvent, type FireOutcome } from "./fire";
+import { authenticate, fireTrigger, isApiTrigger, loadTriggerById, loadTriggerByToken, logTriggerEvent, type FireOutcome } from "./fire";
 import { dispatchQueued, environmentExists, startRun, type Bindings } from "./runs";
 
 /** Largest request body accepted. The body becomes the run input. */
@@ -64,6 +68,7 @@ function answer(outcome: FireOutcome): { body: Record<string, unknown>; status: 
   if (outcome.kind === "started") return { body: { status: outcome.queued ? "queued" : "accepted", runId: outcome.runId, no: outcome.no }, status: 202 };
   if (outcome.kind === "rejected") {
     if (outcome.reason === "filter_not_matched") return { body: { status: "ignored", reason: outcome.reason }, status: 200 };
+    if (outcome.reason === "invalid_input") return { body: { status: "rejected", reason: outcome.reason, problems: outcome.problems }, status: 422 };
     return { body: { status: "rejected", reason: outcome.reason }, status: outcome.status === 422 ? 422 : outcome.status };
   }
   return { body: { status: "skipped", reason: outcome.reason }, status: 409 };
@@ -107,8 +112,8 @@ app.post("/wh/:token", async (c) => {
   if (!body.ok) return c.json({ error: body.error }, body.status);
 
   const query = Object.fromEntries(new URL(c.req.url).searchParams);
-  // A manual trigger may name its environment: `?env=staging`.
-  const outcome = await fireTrigger(sql, c.env, trigger, { body: body.value, headers: c.req.raw.headers, query, source: "webhook", env: trigger.type === "manual" ? (query.env ?? null) : null });
+  // An API trigger may name its environment: `?env=staging`.
+  const outcome = await fireTrigger(sql, c.env, trigger, { body: body.value, headers: c.req.raw.headers, query, source: "webhook", env: isApiTrigger(trigger) ? (query.env ?? null) : null });
   const { body: out, status } = answer(outcome);
   return c.json(out, status);
 });
@@ -202,6 +207,57 @@ app.post("/callbacks/:nodeRunId/:attempt", async (c) => {
     headers: c.req.raw.headers,
   });
   return c.json(answer.body, answer.status);
+});
+
+app.post("/hooks/telegram/:botId", async (c) => {
+  const botId = c.req.param("botId");
+  if (!/^\d{1,20}$/.test(botId)) return c.json({ error: "not_found" }, 404);
+  const sql = c.var.sql;
+  const [subscription] = await sql`select secret_hash from connection_subscriptions where provider = 'telegram' and external_id = ${botId}`;
+  // Unknown bot or wrong secret: 401 tells Telegram (and anyone guessing) nothing more.
+  const given = c.req.header("x-telegram-bot-api-secret-token") ?? "";
+  if (!subscription?.secret_hash || !given || !sameSecret(await sha256Hex(given), subscription.secret_hash)) return c.json({ error: "unauthorized" }, 401);
+  const raw = await c.req.text();
+  const body = parseJsonObject(raw);
+  // Telegram retries what it could not deliver; a body it will send the same way again is answered 200.
+  if (!body.ok) return c.json({ ok: true, ignored: body.error });
+
+  await touchSubscription(sql, "telegram", botId);
+  const chat = telegramChatOf(body.value);
+  if (chat) await learnTelegramChat(sql, botId, chat);
+  const event = telegramEvent(botId, body.value);
+  if (!event) return c.json({ ok: true, ignored: "not_an_event" });
+  // A failure answers 500 (onError), and Telegram delivers the update again.
+  return c.json({ ok: true, ...(await emitConnectionEvent(sql, c.env, event)) });
+});
+
+app.get("/hooks/facebook", (c) => {
+  const token = c.env.FACEBOOK_WEBHOOK_VERIFY_TOKEN;
+  if (c.req.query("hub.mode") !== "subscribe" || !token || !sameSecret(c.req.query("hub.verify_token") ?? "", token)) return c.text("forbidden", 403);
+  return c.text(c.req.query("hub.challenge") ?? "");
+});
+
+app.post("/hooks/facebook", async (c) => {
+  const secret = c.env.FACEBOOK_APP_SECRET;
+  if (!secret) return c.json({ error: "facebook_not_configured" }, 503);
+  const raw = await c.req.text();
+  if (raw.length > MAX_BODY_BYTES * 4) return c.json({ error: "payload_too_large" }, 413);
+  if (!(await facebookSignatureValid(raw, c.req.header("x-hub-signature-256"), secret))) return c.json({ error: "invalid_signature" }, 401);
+  const body = parseJsonObject(raw);
+  if (!body.ok) return c.json({ ok: true, ignored: body.error });
+
+  const sql = c.var.sql;
+  const events = facebookEvents(body.value, c.env.FACEBOOK_APP_ID);
+  for (const page of new Set(events.map((event) => event.account))) await touchSubscription(sql, "facebook-page", page);
+  let fired = 0;
+  let duplicates = 0;
+  // One failing event answers 500 and Facebook sends the whole delivery again: the events already handled are skipped then.
+  for (const event of events) {
+    const result = await emitConnectionEvent(sql, c.env, event);
+    fired += result.fired;
+    if (result.duplicate) duplicates++;
+  }
+  return c.json({ ok: true, events: events.length, duplicates, fired });
 });
 
 app.post("/dispatch-queued", async (c) => {

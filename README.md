@@ -165,5 +165,26 @@ Ingress nghe ở cổng 8788.
 | `POST /triggers/:id/fire` | "Fire now" từ app | Bearer `INGRESS_API_TOKEN` |
 | `POST /dispatch-queued` | Sweep của app: khởi động run đang xếp hàng khi trigger còn slot | Bearer `INGRESS_API_TOKEN` |
 | `POST /runs` | Chạy workflow từ app | Bearer `INGRESS_API_TOKEN` |
+| `POST /hooks/telegram/:botId` | Update của bot có connection bật sự kiện (app gọi `setWebhook`) | Header `X-Telegram-Bot-Api-Secret-Token`, so SHA-256 với `connection_subscriptions.secret_hash` |
+| `GET /hooks/facebook` | Facebook xác minh webhook của app | `hub.verify_token` = secret `FACEBOOK_WEBHOOK_VERIFY_TOKEN` |
+| `POST /hooks/facebook` | Webhook Page: comment, Messenger, Lead Ads | `X-Hub-Signature-256` (HMAC body bằng `FACEBOOK_APP_SECRET`) |
+
+### Sự kiện của connection (`src/connection-events.ts`)
+
+Mỗi delivery được chuẩn hóa thành sự kiện (`telegram.message`, `telegram.channel_post`, `telegram.callback_query`, `facebook.comment`, `facebook.message`, `facebook.postback`, `facebook.lead`), ghi `inbound_event_receipts` để delivery gửi lại không chạy trùng, rồi bắn trigger `event` của mọi connection của tài khoản đó đang phát loại sự kiện ấy (`connections.events`; sự kiện do chính tài khoản gửi, `sender.role = self`, chỉ tới connection bật `fromSelf`). Lỗi khi bắn: xóa receipt và trả 500 để dịch vụ gửi lại. Cần thêm secret (cùng giá trị với app):
+
+```bash
+npx wrangler secret put FACEBOOK_APP_ID
+```
+
+```bash
+npx wrangler secret put FACEBOOK_APP_SECRET
+```
+
+```bash
+npx wrangler secret put FACEBOOK_WEBHOOK_VERIFY_TOKEN
+```
+
+Sau khi deploy, trỏ webhook Page của app Facebook về đây một lần, từ thư mục `xaas-workflows`: `npx tsx scripts/setup-facebook-webhook.ts --yes`.
 
 Mỗi lượt gọi trigger qua các bước: bật, workflow `active`, rate limit, filter, input mapping, rồi chính sách concurrency; mọi kết quả ghi vào `trigger_events`. Secret HMAC / bearer lưu mã hóa; Worker cần secret `TRIGGERS_ENCRYPTION_KEY` (cùng giá trị với app). `src/graph.ts` giống từng byte với bản ở runner và app.
