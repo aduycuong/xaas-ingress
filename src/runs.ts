@@ -25,6 +25,11 @@ export type Bindings = {
   INGRESS_API_TOKEN_NEXT?: string;
   /** Key that decrypts the secrets of webhook triggers (same value as the app's TRIGGERS_ENCRYPTION_KEY). */
   TRIGGERS_ENCRYPTION_KEY?: string;
+  /** Facebook app of the xaas-workflows app (same values): checks `X-Hub-Signature-256` of Page webhooks, tells XAAS's own Messenger echoes. */
+  FACEBOOK_APP_ID?: string;
+  FACEBOOK_APP_SECRET?: string;
+  /** What the Webhooks product of the Facebook app sends to verify `GET /hooks/facebook` (set the same text there). */
+  FACEBOOK_WEBHOOK_VERIFY_TOKEN?: string;
 };
 
 /** Route of the runner. A runner change that reorders or renames steps comes with a new route. */
@@ -50,7 +55,7 @@ export type NewRun = {
   workflowId: string;
   workflowVersionId: string;
   triggerId: string | null;
-  triggerType: "cron" | "webhook" | "manual" | "event" | "retry";
+  triggerType: "cron" | "webhook" | "api" | "event" | "manual" | "retry";
   input: Record<string, unknown>;
   /** The raw call that started the run (`{{ trigger… }}`); none for a run started from the app. */
   triggerData?: Record<string, unknown> | null;
