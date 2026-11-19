@@ -1,7 +1,7 @@
 // Pure parts of receiving a call: checking who sent it, and turning it into a run input. No I/O.
 
 import { sameSecret, signBody } from "./crypto";
-import { evaluateIf, resolveValue, type IfNode, type Scope } from "./graph";
+import { evaluateIf, ExpressionError, resolveValue, type IfNode, type Scope } from "./graph";
 
 export type AuthMode = "none" | "hmac" | "bearer";
 export type AuthProblem = "missing_auth" | "invalid_signature";
@@ -30,22 +30,28 @@ export function callScope(parts: CallParts): Scope {
 
 export type Filter = { join: "and" | "or"; conditions: { left: unknown; op: IfNode["data"]["conditions"][number]["op"]; right?: unknown }[] };
 
-/** Whether the call passes the trigger's filter. No filter passes everything. A value that is missing counts as empty. */
-export function passesFilter(filter: Filter | null | undefined, scope: Scope): boolean {
+/** Whether the call passes the trigger's filter. No filter passes everything. A value that is missing (or fails) counts as empty. */
+export async function passesFilter(filter: Filter | null | undefined, scope: Scope): Promise<boolean> {
   if (!filter || !Array.isArray(filter.conditions) || filter.conditions.length === 0) return true;
   const node: IfNode = { id: "filter", type: "if", data: { join: filter.join === "or" ? "or" : "and", conditions: filter.conditions } };
-  return evaluateIf(node, scope) === "true";
+  return (await evaluateIf(node, scope)) === "true";
 }
 
 /**
  * The run input: each mapped value resolved against the call; without a mapping, the body. A mapped value is a typed literal
- * (text, number, boolean or JSON, kept as stored) or, for a string with `{{ … }}`, an expression.
+ * (text, number, boolean or JSON, kept as stored) or, for a string with `{{ … }}`, an expression. A value that is missing, or
+ * whose expression fails, is left out (the input schema then says what is wrong).
  */
-export function buildInput(mapping: Record<string, unknown> | null | undefined, scope: Scope, body: Record<string, unknown>): Record<string, unknown> {
+export async function buildInput(mapping: Record<string, unknown> | null | undefined, scope: Scope, body: Record<string, unknown>): Promise<Record<string, unknown>> {
   if (!mapping || Object.keys(mapping).length === 0) return body;
   const out: Record<string, unknown> = {};
   for (const [name, value] of Object.entries(mapping)) {
-    const resolved = resolveValue(value, scope, false);
+    let resolved: unknown;
+    try {
+      resolved = await resolveValue(value, scope, false);
+    } catch (error) {
+      if (!(error instanceof ExpressionError)) throw error;
+    }
     if (resolved !== undefined) out[name] = resolved;
   }
   return out;

@@ -130,10 +130,10 @@ export async function fireTrigger(sql: Sql, env: Bindings, trigger: TriggerRow, 
   // The raw call: what `{{ trigger… }}` reads in the filter, the mapping and (stored with the run) the workflow.
   const triggerData: CallParts = { body: call.body, headers: call.headers ? safeHeaders(call.headers) : {}, query: call.query ?? {}, ...(trigger.type === "cron" ? { scheduledAt: new Date().toISOString() } : {}) };
   const scope = callScope(triggerData);
-  if (call.source !== "api" && call.source !== "schedule" && !passesFilter(trigger.filter, scope)) return reject("filter_not_matched", 422);
+  if (call.source !== "api" && call.source !== "schedule" && !(await passesFilter(trigger.filter, scope))) return reject("filter_not_matched", 422);
 
   // The mapping makes the input for every kind of call; a schedule has no body, so only its fixed values and `scheduledAt` count.
-  const input = buildInput(trigger.input_mapping, scope, call.body);
+  const input = await buildInput(trigger.input_mapping, scope, call.body);
 
   // Every trigger's input (webhook, API, event, schedule, "Fire now") must fit the input schema of the version that runs.
   const problems = validateInput(await inputSchemaOf(sql, trigger.current_version_id), input);

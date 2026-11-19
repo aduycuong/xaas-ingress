@@ -32,32 +32,32 @@ test("bearer and none", async () => {
 
 const scope = (body: unknown, headers: Record<string, string> = {}, query: Record<string, string> = {}) => callScope({ body, headers, query });
 
-test("filter: conditions on the body, headers and query; missing counts as empty; no filter passes", () => {
-  const filter = { join: "and" as const, conditions: [{ left: "{{ trigger.body.status }}", op: "equals" as const, right: "published" }, { left: "{{ trigger.headers.x-event }}", op: "is_not_empty" as const }] };
-  assert.equal(passesFilter(filter, scope({ status: "published" }, { "x-event": "post" })), true);
-  assert.equal(passesFilter(filter, scope({ status: "draft" }, { "x-event": "post" })), false);
-  assert.equal(passesFilter(filter, scope({ status: "published" })), false);
-  assert.equal(passesFilter({ join: "or", conditions: [{ left: "{{ trigger.query.kind }}", op: "equals", right: "a" }, { left: "{{ trigger.body.n }}", op: "gt", right: 3 }] }, scope({ n: 5 })), true);
-  assert.equal(passesFilter(null, scope({})), true);
+test("filter: conditions on the body, headers and query; missing counts as empty; no filter passes", async () => {
+  const filter = { join: "and" as const, conditions: [{ left: "{{ trigger.body.status }}", op: "equals" as const, right: "published" }, { left: "{{ trigger.headers.`x-event` }}", op: "is_not_empty" as const }] };
+  assert.equal(await passesFilter(filter, scope({ status: "published" }, { "x-event": "post" })), true);
+  assert.equal(await passesFilter(filter, scope({ status: "draft" }, { "x-event": "post" })), false);
+  assert.equal(await passesFilter(filter, scope({ status: "published" })), false);
+  assert.equal(await passesFilter({ join: "or", conditions: [{ left: "{{ trigger.query.kind }}", op: "equals", right: "a" }, { left: "{{ trigger.body.n }}", op: "gt", right: 3 }] }, scope({ n: 5 })), true);
+  assert.equal(await passesFilter(null, scope({})), true);
 });
 
-test("input mapping: values from body, headers and query; without a mapping the body is the input", () => {
+test("input mapping: values from body, headers and query; without a mapping the body is the input", async () => {
   const body = { email: "a@b.c", items: [1, 2] };
-  const mapped = buildInput({ email: "{{ trigger.body.email }}", count: "{{ trigger.body.items.length }}", source: "{{ trigger.query.src }}", fixed: "hello", missing: "{{ trigger.body.nope }}" }, scope(body, {}, { src: "ads" }), body);
-  assert.deepEqual(mapped, { email: "a@b.c", count: 2, source: "ads", fixed: "hello" });
-  assert.deepEqual(buildInput(null, scope(body), body), body);
-  assert.deepEqual(buildInput({}, scope(body), body), body);
+  const mapped = await buildInput({ email: "{{ trigger.body.email }}", count: "{{ $count(trigger.body.items) }}", label: '{{ "<" & trigger.body.email & ">" }}', broken: "{{ $number(trigger.body.email) }}", source: "{{ trigger.query.src }}", fixed: "hello", missing: "{{ trigger.body.nope }}" }, scope(body, {}, { src: "ads" }), body);
+  assert.deepEqual(mapped, { email: "a@b.c", count: 2, label: "<a@b.c>", source: "ads", fixed: "hello" });
+  assert.deepEqual(await buildInput(null, scope(body), body), body);
+  assert.deepEqual(await buildInput({}, scope(body), body), body);
 });
 
-test("input mapping: fixed values keep their type (text, number, boolean, JSON), also for a schedule with no body", () => {
+test("input mapping: fixed values keep their type (text, number, boolean, JSON), also for a schedule with no body", async () => {
   const mapping = { page: "A", limit: 50, dry: false, tags: ["x", "y"], zero: 0, empty: "", at: "{{ trigger.scheduledAt }}", nope: "{{ trigger.body.nope }}" };
   const call = callScope({ body: {}, headers: {}, query: {}, scheduledAt: "2026-11-12T08:00:00.000Z" });
-  const input = buildInput(mapping, call, {});
+  const input = await buildInput(mapping, call, {});
   assert.deepEqual(input, { page: "A", limit: 50, dry: false, tags: ["x", "y"], zero: 0, empty: "", at: "2026-11-12T08:00:00.000Z" });
   assert.equal(typeof input.limit, "number");
   assert.equal(typeof input.dry, "boolean");
   // A schedule with no mapping has an empty input.
-  assert.deepEqual(buildInput(null, call, {}), {});
+  assert.deepEqual(await buildInput(null, call, {}), {});
 });
 
 test("credentials never reach the filter scope", () => {
