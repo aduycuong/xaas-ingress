@@ -70,6 +70,8 @@ export type NewRun = {
   test?: { nodeId?: string; outputs?: Record<string, unknown> } | null;
   /** The trigger's policy. Without it (a run started from the app) the run takes no slot and starts at once. */
   concurrency?: { triggerId: string; policy: "parallel" | "skip" | "queue"; max: number };
+  /** An API trigger with callbacks on: where the result is POSTed when the run ends (a `run_callbacks` row, made with the run). */
+  callbackUrl?: string | null;
 };
 
 export type InsertedRun = { runId: string; no: number; dispatched: boolean };
@@ -115,6 +117,10 @@ export async function insertRun(sql: Sql, run: NewRun): Promise<InsertedRun | nu
         ${run.env ?? "production"}, ${run.test ? JSON.stringify(run.test) : null}::jsonb, case when (select c from slots) < ${max}::int then now() end
       from counter
       returning id, no, dispatched_at`,
+    // In the same transaction, so the row exists before the run can end. Nothing when the run was dropped (`skip`).
+    ...(run.callbackUrl
+      ? [sql`insert into run_callbacks (id, run_id, workspace_id, trigger_id, url) select ${uuidv7()}, ${runId}, ${run.workspaceId}, ${triggerId}::uuid, ${run.callbackUrl} where exists (select 1 from runs where id = ${runId})`]
+      : []),
   ]);
   const row = inserted[0] as { id: string; no: number; dispatched_at: string | null } | undefined;
   return row ? { runId: row.id, no: Number(row.no), dispatched: row.dispatched_at !== null } : null;

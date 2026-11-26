@@ -4,6 +4,7 @@
 
 import { type TriggerRow, fireTrigger, logTriggerEvent } from "./fire";
 import { dispatchQueued, type Bindings, type Sql } from "./runs";
+import { scheduleCallback } from "./results";
 
 /** Longest chain of runs caused by one another before the next link is refused. */
 export const MAX_EVENT_DEPTH = 5;
@@ -14,15 +15,29 @@ export function chainBlocks(chain: { workflow_id: string }[], targetWorkflowId: 
   return chain.some((link) => link.workflow_id === targetWorkflowId) ? "loop_detected" : null;
 }
 
-export async function handleRunFinished(sql: Sql, env: Bindings, runId: string): Promise<{ queuedStarted: number; fired: number; blocked: number }> {
+/**
+ * `callbackOnly`: the app ended the run itself (cancelled it, or the stuck sweep failed it) and already gave its slot
+ * away; only the result callback is left to send.
+ */
+export async function handleRunFinished(
+  sql: Sql,
+  env: Bindings,
+  runId: string,
+  options: { ingressOrigin: string; callbackOnly?: boolean },
+): Promise<{ queuedStarted: number; fired: number; blocked: number; callback: boolean }> {
+  // The caller of an API trigger waiting for the result first: it does not depend on anything below.
+  const callback = await scheduleCallback(sql, env, { runId, ingressOrigin: options.ingressOrigin });
+  if (options.callbackOnly) return { queuedStarted: 0, fired: 0, blocked: 0, callback };
+
   const [run] = await sql`
     select r.id, r.no, r.status, r.error, r.test, r.workspace_id, r.workflow_id, r.trigger_id, w.slug as workflow_slug, w.name as workflow_name
     from runs r join workflows w on w.id = r.workflow_id where r.id = ${runId}::uuid`;
   // A run started from the editor takes no slot and fires no event trigger.
-  if (!run || run.test) return { queuedStarted: 0, fired: 0, blocked: 0 };
+  if (!run || run.test) return { queuedStarted: 0, fired: 0, blocked: 0, callback };
+  const done = (counts: { queuedStarted: number; fired: number; blocked: number }) => ({ ...counts, callback });
 
   const queuedStarted = run.trigger_id ? await dispatchQueued(sql, env, run.trigger_id) : 0;
-  if (run.status !== "succeeded" && run.status !== "failed") return { queuedStarted, fired: 0, blocked: 0 };
+  if (run.status !== "succeeded" && run.status !== "failed") return done({ queuedStarted, fired: 0, blocked: 0 });
 
   const triggers = (await sql`
     select t.id, t.type, t.enabled, t.workspace_id, t.workflow_id, t.auth_mode, t.auth_secret, t.filter, t.input_mapping,
@@ -30,7 +45,7 @@ export async function handleRunFinished(sql: Sql, env: Bindings, runId: string):
     from triggers t join workflows w on w.id = t.workflow_id
     where t.workspace_id = ${run.workspace_id}::uuid and t.type = 'event' and t.enabled
       and t.event_type = ${`run.${run.status}`} and (t.event_workflow_id is null or t.event_workflow_id = ${run.workflow_id}::uuid)`) as unknown as TriggerRow[];
-  if (triggers.length === 0) return { queuedStarted, fired: 0, blocked: 0 };
+  if (triggers.length === 0) return done({ queuedStarted, fired: 0, blocked: 0 });
 
   const chain = (await sql`
     with recursive chain as (
@@ -57,5 +72,5 @@ export async function handleRunFinished(sql: Sql, env: Bindings, runId: string):
     const outcome = await fireTrigger(sql, env, trigger, { body: payload, source: "event", causeRunId: runId });
     if (outcome.kind === "started") fired++;
   }
-  return { queuedStarted, fired, blocked };
+  return done({ queuedStarted, fired, blocked });
 }

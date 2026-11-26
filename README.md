@@ -159,9 +159,11 @@ Ingress nghe ở cổng 8788.
 
 | Ruta | Dùng cho | Xác thực |
 | --- | --- | --- |
-| `POST /wh/:token` | Trigger `webhook` và `manual` (API) | Token trong URL, cộng cấu hình của trigger: `hmac` (header `X-XaaS-Signature: sha256=<hex>` của body thô) hoặc `bearer` |
+| `POST /wh/:token` | Trigger `webhook` và `api` | Token trong URL, cộng cấu hình của trigger: `hmac` (header `X-Xaas-Signature: sha256=<hex>` của body thô, hoặc của `<timestamp>.<body thô>` khi có `X-Xaas-Timestamp`, lệch tối đa 5 phút) hoặc `bearer` |
+| `GET /wh/:token/runs/:runId` | Trạng thái và kết quả một run của trigger `api` (`?wait=0..30` giữ câu trả lời tới khi run xong) | Như trên; `hmac` ký `<timestamp>.GET.<path>`, `X-Xaas-Timestamp` bắt buộc |
 | `POST /internal/triggers/:id/fire` | Schedule QStash của trigger `cron` | Chữ ký Upstash |
-| `POST /internal/events/run-finished` | Runner báo run kết thúc: chạy run đang chờ slot và bắn trigger `event` | Chữ ký Upstash |
+| `POST /internal/events/run-finished` | Runner báo run kết thúc: gửi result callback, chạy run đang chờ slot và bắn trigger `event`. App gửi `{ runId, callbackOnly: true }` khi tự kết thúc run (hủy, sweep run treo) | Chữ ký Upstash |
+| `POST /internal/callbacks/deliver` | Một lần POST kết quả của run tới callback URL; trả 502 để QStash thử lại | Chữ ký Upstash |
 | `POST /triggers/:id/fire` | "Fire now" từ app | Bearer `INGRESS_API_TOKEN` |
 | `POST /dispatch-queued` | Sweep của app: khởi động run đang xếp hàng khi trigger còn slot | Bearer `INGRESS_API_TOKEN` |
 | `POST /runs` | Chạy workflow từ app | Bearer `INGRESS_API_TOKEN` |
@@ -186,5 +188,11 @@ npx wrangler secret put FACEBOOK_WEBHOOK_VERIFY_TOKEN
 ```
 
 Sau khi deploy, trỏ webhook Page của app Facebook về đây một lần, từ thư mục `xaas-workflows`: `npx tsx scripts/setup-facebook-webhook.ts --yes`.
+
+### Kết quả của trigger `api` (`src/results.ts`, `src/callback-target.ts`)
+
+- Câu trả lời 202 có `statusUrl` (`/wh/:token/runs/:runId`). `GET` trả `{ runId, no, status, env, createdAt, startedAt, finishedAt, output, error, statusUrl }`; chỉ run thật của chính trigger đó (run test, run của trigger khác: 404).
+- **Result callback** (`triggers.callback_*`): URL mặc định, hoặc header `X-Xaas-Callback-Url` khi origin nằm trong `callback_allowed_origins` (`https://*.host` khớp subdomain). Callback tắt mà gọi có header: `422 callbacks_off`; origin không được phép: `422 callback_url_not_allowed`. URL được chốt lúc nhận lời gọi: dòng `run_callbacks` tạo cùng transaction với run.
+- Khi run kết thúc, `run-finished` chuyển `run_callbacks` từ `waiting` sang `sending` (một lần) và publish QStash tới `/internal/callbacks/deliver`, 3 lần thử lại. Mỗi lần thử ký lại: `X-Xaas-Timestamp` + `X-Xaas-Signature: sha256=<hex HMAC(secret của trigger, "<timestamp>.<body>")>`, cùng `X-Xaas-Event`, `X-Xaas-Delivery-Id`, `X-Xaas-Run-Id`; không theo redirect, timeout 15 s. Output trên 64 KB bị bỏ (`outputOmitted: true`).
 
 Mỗi lượt gọi trigger qua các bước: bật, workflow `active`, rate limit, filter, input mapping, rồi chính sách concurrency; mọi kết quả ghi vào `trigger_events`. Secret HMAC / bearer lưu mã hóa; Worker cần secret `TRIGGERS_ENCRYPTION_KEY` (cùng giá trị với app). `src/graph.ts` giống từng byte với bản ở runner và app.

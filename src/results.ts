@@ -1,0 +1,167 @@
+// The result of a run as the caller of an API trigger sees it: the answer of `GET /wh/:token/runs/:runId` and the body of
+// the result callback (`run_callbacks` of the app), POSTed through QStash when the run ends, signed with the trigger's secret.
+
+import { Client } from "@upstash/qstash";
+import { signBody } from "./crypto";
+import { triggerSecret } from "./fire";
+import type { Bindings, Sql } from "./runs";
+
+export const ENDED_STATUSES = ["succeeded", "failed", "cancelled"] as const;
+
+/** Attempts QStash makes after the first one; with its backoff they span a few minutes. */
+export const CALLBACK_RETRIES = 3;
+
+/** Largest output sent inside a callback; a larger one is left out (`outputOmitted`) and read with `statusUrl`. */
+export const MAX_CALLBACK_OUTPUT_BYTES = 64 * 1024;
+
+/** How long one delivery waits for the receiver to answer. */
+const CALLBACK_TIMEOUT_MS = 15_000;
+
+export type RunResult = {
+  runId: string;
+  no: number;
+  status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  env: string;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  /** What the workflow returned; null until it succeeds. */
+  output: unknown;
+  error: { code: string; message: string } | null;
+  statusUrl: string;
+};
+
+type RunRow = { id: string; no: number; status: RunResult["status"]; env: string; created_at: Date | string; started_at: Date | string | null; finished_at: Date | string | null; output: unknown; error: { code?: string; message?: string } | null };
+
+const iso = (value: Date | string | null) => (value === null ? null : new Date(value).toISOString());
+
+export const isEnded = (status: string) => (ENDED_STATUSES as readonly string[]).includes(status);
+
+export const statusUrlOf = (origin: string, token: string, runId: string) => `${origin.replace(/\/$/, "")}/wh/${token}/runs/${runId}`;
+
+export function toRunResult(row: RunRow, statusUrl: string): RunResult {
+  return {
+    runId: row.id,
+    no: Number(row.no),
+    status: row.status,
+    env: row.env,
+    createdAt: iso(row.created_at) as string,
+    startedAt: iso(row.started_at),
+    finishedAt: iso(row.finished_at),
+    output: row.status === "succeeded" ? (row.output ?? null) : null,
+    error: row.error ? { code: row.error.code ?? "ERROR", message: row.error.message ?? "" } : null,
+    statusUrl,
+  };
+}
+
+/** The body of a result callback. An output larger than `MAX_CALLBACK_OUTPUT_BYTES` is left out. */
+export function callbackBody(result: RunResult, event: string): string {
+  const full = JSON.stringify({ event, ...result });
+  if (new TextEncoder().encode(JSON.stringify(result.output)).length <= MAX_CALLBACK_OUTPUT_BYTES) return full;
+  return JSON.stringify({ event, ...result, output: null, outputOmitted: true });
+}
+
+/** A real run of this trigger (test runs and runs of other triggers are not found), as its caller sees it. */
+export async function loadRunResult(sql: Sql, params: { triggerId: string; runId: string; statusUrl: string }): Promise<RunResult | null> {
+  const [row] = await sql`
+    select id, no, status, env, created_at, started_at, finished_at, output, error from runs
+    where id = ${params.runId}::uuid and trigger_id = ${params.triggerId}::uuid and test is null`;
+  return row ? toRunResult(row as RunRow, params.statusUrl) : null;
+}
+
+/**
+ * Waits until the run has ended or `seconds` passed, reading it once a second, then answers its result.
+ * `seconds` 0 reads once.
+ */
+export async function waitForRunResult(sql: Sql, params: { triggerId: string; runId: string; statusUrl: string; seconds: number }): Promise<RunResult | null> {
+  const deadline = Date.now() + params.seconds * 1000;
+  for (;;) {
+    const result = await loadRunResult(sql, params);
+    if (!result || isEnded(result.status) || Date.now() + 1000 > deadline) return result;
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+}
+
+/**
+ * The run has ended: hands its result callback to QStash, once (`waiting` → `sending`). Nothing when the run has no
+ * callback, has not ended, or was already handed over. Returns whether a callback was sent.
+ */
+export async function scheduleCallback(sql: Sql, env: Bindings, params: { runId: string; ingressOrigin: string }): Promise<boolean> {
+  const [claimed] = await sql`
+    update run_callbacks c set status = 'sending', event = 'run.' || r.status
+    from runs r
+    where c.run_id = ${params.runId}::uuid and r.id = c.run_id and c.status = 'waiting' and r.status in ('succeeded', 'failed', 'cancelled')
+    returning c.id`;
+  if (!claimed) return false;
+  try {
+    await new Client({ token: env.QSTASH_TOKEN, baseUrl: env.QSTASH_URL || undefined }).publishJSON({
+      url: `${params.ingressOrigin.replace(/\/$/, "")}/internal/callbacks/deliver`,
+      body: { callbackId: claimed.id },
+      retries: CALLBACK_RETRIES,
+      deduplicationId: `run-callback-${claimed.id}`,
+    });
+  } catch (error) {
+    // Back to waiting, so the retry of the run-finished message (or the next one) hands it over again.
+    await sql`update run_callbacks set status = 'waiting', event = null where id = ${claimed.id}::uuid`;
+    throw error;
+  }
+  return true;
+}
+
+export type DeliveryAnswer = { status: 200 | 502; body: Record<string, unknown> };
+
+/**
+ * One attempt to POST a result to its URL, signed afresh (so a retry minutes later still passes the receiver's
+ * timestamp check). A 2xx answer delivers it; otherwise 502 makes QStash try again, until its last retry (`retried`).
+ */
+export async function deliverCallback(sql: Sql, env: Bindings, params: { callbackId: string; ingressOrigin: string; retried: number; now?: number }): Promise<DeliveryAnswer> {
+  const [row] = await sql`
+    select c.id, c.url, c.status as callback_status, c.event, t.auth_secret, t.webhook_token,
+      r.id as run_id, r.no, r.status, r.env, r.created_at, r.started_at, r.finished_at, r.output, r.error
+    from run_callbacks c join runs r on r.id = c.run_id left join triggers t on t.id = c.trigger_id
+    where c.id = ${params.callbackId}::uuid`;
+  if (!row || row.callback_status !== "sending") return { status: 200, body: { skipped: row ? row.callback_status : "not_found" } };
+
+  const finalAttempt = params.retried >= CALLBACK_RETRIES;
+  const record = async (outcome: { ok: boolean; statusCode: number | null; error: string | null }) => {
+    const status = outcome.ok ? "delivered" : finalAttempt ? "failed" : "sending";
+    await sql`
+      update run_callbacks set attempts = attempts + 1, status = ${status}, last_status_code = ${outcome.statusCode}, last_error = ${outcome.error},
+        delivered_at = case when ${outcome.ok} then now() else delivered_at end
+      where id = ${params.callbackId}::uuid`;
+    return status;
+  };
+
+  const secret = row.auth_secret ? await triggerSecret(env, { auth_secret: row.auth_secret as string }) : null;
+  if (!secret || !row.webhook_token) {
+    // The trigger was deleted or lost its secret: an unsigned result would not be trusted, so it is not sent.
+    await sql`update run_callbacks set status = 'failed', last_error = 'The trigger no longer exists or has no secret.' where id = ${params.callbackId}::uuid`;
+    return { status: 200, body: { status: "failed" } };
+  }
+
+  const result = toRunResult({ ...row, id: row.run_id } as RunRow, statusUrlOf(params.ingressOrigin, row.webhook_token, row.run_id));
+  const body = callbackBody(result, row.event ?? `run.${row.status}`);
+  const timestamp = String(Math.floor((params.now ?? Date.now()) / 1000));
+  const headers = {
+    "Content-Type": "application/json",
+    "User-Agent": "XAAS-Workflows-Callback/1",
+    "X-Xaas-Event": row.event ?? `run.${row.status}`,
+    "X-Xaas-Delivery-Id": row.id,
+    "X-Xaas-Run-Id": row.run_id,
+    "X-Xaas-Timestamp": timestamp,
+    "X-Xaas-Signature": await signBody(secret, `${timestamp}.${body}`),
+  };
+
+  let outcome: { ok: boolean; statusCode: number | null; error: string | null };
+  try {
+    // No redirects: the URL was checked against the allowed origins, a redirect could lead anywhere.
+    const response = await fetch(row.url, { method: "POST", headers, body, redirect: "manual", signal: AbortSignal.timeout(CALLBACK_TIMEOUT_MS) });
+    const ok = response.status >= 200 && response.status < 300;
+    outcome = { ok, statusCode: response.status, error: ok ? null : `The URL answered ${response.status}.` };
+    await response.body?.cancel();
+  } catch (error) {
+    outcome = { ok: false, statusCode: null, error: error instanceof Error ? error.message.slice(0, 300) : "The URL could not be reached." };
+  }
+  const status = await record(outcome);
+  return status === "sending" ? { status: 502, body: { status, error: outcome.error } } : { status: 200, body: { status } };
+}

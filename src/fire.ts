@@ -1,6 +1,7 @@
 // Firing a trigger: the checks every call goes through, in order, and a record of what happened.
 
 import { decryptSecret } from "./crypto";
+import { resolveCallbackTarget } from "./callback-target";
 import { validateInput, type InputProblem } from "./input-schema";
 import { type Bindings, type Sql, environmentExists, startRun, uuidv7 } from "./runs";
 import { buildInput, callScope, checkAuth, passesFilter, safeHeaders, type AuthMode, type CallParts, type Filter } from "./webhook";
@@ -25,11 +26,16 @@ export type TriggerRow = {
   current_version_id: string | null;
   /** `event` triggers: what they listen to (`run.failed`, `file.created`…). */
   event_type?: string | null;
+  /** API triggers: the last segment of their URL, and where the results of their runs go (`callback-target.ts`). */
+  webhook_token?: string | null;
+  callback_enabled?: boolean;
+  callback_url?: string | null;
+  callback_allowed_origins?: string[] | null;
 };
 
 export type FireOutcome =
   | { kind: "started"; runId: string; no: number; queued: boolean }
-  | { kind: "rejected"; reason: "invalid_signature" | "missing_auth" | "filter_not_matched" | "rate_limited" | "unknown_environment"; status: 401 | 422 | 429 }
+  | { kind: "rejected"; reason: "invalid_signature" | "missing_auth" | "stale_signature" | "filter_not_matched" | "rate_limited" | "unknown_environment" | "callbacks_off" | "callback_url_not_allowed"; status: 401 | 422 | 429 }
   /** The input (after the mapping) does not fit the input schema of the published version. */
   | { kind: "rejected"; reason: "invalid_input"; status: 422; problems: InputProblem[] }
   | { kind: "skipped"; reason: "trigger_disabled" | "workflow_not_active" | "already_running" | "loop_detected" };
@@ -37,7 +43,8 @@ export type FireOutcome =
 export async function loadTriggerById(sql: Sql, id: string): Promise<TriggerRow | null> {
   const [row] = await sql`
     select t.id, t.type, t.enabled, t.workspace_id, t.workflow_id, t.auth_mode, t.auth_secret, t.filter, t.input_mapping,
-      t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, t.env, t.event_type, w.status as workflow_status, w.current_version_id
+      t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, t.env, t.event_type, t.webhook_token,
+      t.callback_enabled, t.callback_url, t.callback_allowed_origins, w.status as workflow_status, w.current_version_id
     from triggers t join workflows w on w.id = t.workflow_id where t.id = ${id}::uuid`;
   return (row as TriggerRow | undefined) ?? null;
 }
@@ -45,7 +52,8 @@ export async function loadTriggerById(sql: Sql, id: string): Promise<TriggerRow 
 export async function loadTriggerByToken(sql: Sql, token: string): Promise<TriggerRow | null> {
   const [row] = await sql`
     select t.id, t.type, t.enabled, t.workspace_id, t.workflow_id, t.auth_mode, t.auth_secret, t.filter, t.input_mapping,
-      t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, t.env, w.status as workflow_status, w.current_version_id
+      t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, t.env, t.webhook_token,
+      t.callback_enabled, t.callback_url, t.callback_allowed_origins, w.status as workflow_status, w.current_version_id
     from triggers t join workflows w on w.id = t.workflow_id
     where t.webhook_token = ${token} and t.type in ('webhook', 'api', 'manual')`;
   return (row as TriggerRow | undefined) ?? null;
@@ -73,15 +81,17 @@ export async function logTriggerEvent(sql: Sql, trigger: Pick<TriggerRow, "id" |
 /** Checks the signature or bearer token of a webhook call against the trigger's stored secret. */
 export async function authenticate(env: Bindings, trigger: TriggerRow, rawBody: string, headers: Headers) {
   if (trigger.auth_mode === "none") return null;
-  let secret: string | null = null;
-  if (trigger.auth_secret && env.TRIGGERS_ENCRYPTION_KEY) {
-    try {
-      secret = await decryptSecret(trigger.auth_secret, env.TRIGGERS_ENCRYPTION_KEY);
-    } catch {
-      secret = null;
-    }
+  return checkAuth({ mode: trigger.auth_mode, secret: await triggerSecret(env, trigger), rawBody, headers });
+}
+
+/** The trigger's secret (HMAC key or bearer token) in clear, or null when it has none or it cannot be read. */
+export async function triggerSecret(env: Bindings, trigger: Pick<TriggerRow, "auth_secret">): Promise<string | null> {
+  if (!trigger.auth_secret || !env.TRIGGERS_ENCRYPTION_KEY) return null;
+  try {
+    return await decryptSecret(trigger.auth_secret, env.TRIGGERS_ENCRYPTION_KEY);
+  } catch {
+    return null;
   }
-  return checkAuth({ mode: trigger.auth_mode, secret, rawBody, headers });
 }
 
 export type Call = {
@@ -96,6 +106,8 @@ export type Call = {
   causeFileId?: string | null;
   /** The environment an API trigger's caller asked for (`?env=` or `env` in "Fire now"); other triggers use their own. */
   env?: string | null;
+  /** API triggers: where the caller asked the result to go (`X-Xaas-Callback-Url`); checked against the allowed origins. */
+  callbackUrl?: string | null;
 };
 
 /**
@@ -127,6 +139,14 @@ export async function fireTrigger(sql: Sql, env: Bindings, trigger: TriggerRow, 
   const runEnv = isApiTrigger(trigger) ? (call.env || "production") : (trigger.env || "production");
   if (isApiTrigger(trigger) && call.env && !(await environmentExists(sql, trigger.workspace_id, call.env))) return reject("unknown_environment", 422);
 
+  // Where the result goes, decided now: a later change of the trigger does not move the result of a run already accepted.
+  let callbackUrl: string | null = null;
+  if (isApiTrigger(trigger)) {
+    const target = resolveCallbackTarget({ enabled: Boolean(trigger.callback_enabled), url: trigger.callback_url ?? null, allowedOrigins: trigger.callback_allowed_origins ?? [] }, call.callbackUrl);
+    if (!target.ok) return reject(target.reason, 422);
+    callbackUrl = target.url;
+  }
+
   // The raw call: what `{{ trigger… }}` reads in the filter, the mapping and (stored with the run) the workflow.
   const triggerData: CallParts = { body: call.body, headers: call.headers ? safeHeaders(call.headers) : {}, query: call.query ?? {}, ...(trigger.type === "cron" ? { scheduledAt: new Date().toISOString() } : {}) };
   const scope = callScope(triggerData);
@@ -154,6 +174,7 @@ export async function fireTrigger(sql: Sql, env: Bindings, trigger: TriggerRow, 
     causeFileId: call.causeFileId ?? null,
     env: runEnv,
     concurrency: { triggerId: trigger.id, policy: trigger.concurrency_policy, max: trigger.concurrency_policy === "parallel" ? trigger.concurrency_max : 1 },
+    callbackUrl,
   });
   if (!inserted) return skip("already_running");
   await logTriggerEvent(sql, trigger, "fired", inserted.dispatched ? null : "queued", inserted.runId);
