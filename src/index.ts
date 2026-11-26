@@ -1,7 +1,9 @@
 // Ingress Worker: every way a run is started from outside goes through here.
 //   POST /wh/:token                          webhook or API trigger (token in the URL, plus the trigger's own auth)
+//   GET  /wh/:token/runs/:runId              state and result of a run of an API trigger (`?wait=`; the trigger's auth)
 //   POST /internal/triggers/:id/fire         QStash schedule of a cron trigger (Upstash signature)
-//   POST /internal/events/run-finished       QStash message from the runner when a run ends (Upstash signature)
+//   POST /internal/events/run-finished       QStash message from the runner (or the app) when a run ends (Upstash signature)
+//   POST /internal/callbacks/deliver         QStash: one attempt to POST a run's result to its callback URL (Upstash signature)
 //   POST /triggers/:id/fire                  "Fire now" from the xaas-workflows app (bearer token)
 //   POST /dispatch-queued                    the app's sweep: start queued runs whose trigger has a free slot (bearer token)
 //   POST /runs                               manual run from the xaas-workflows app (bearer token)
@@ -19,11 +21,16 @@ import { handleCallback } from "./callbacks";
 import { emitConnectionEvent, facebookEvents, facebookSignatureValid, learnTelegramChat, sha256Hex, telegramChatOf, telegramEvent, touchSubscription } from "./connection-events";
 import { handleRunFinished } from "./events";
 import { fileEvents, fireWithFile, handleFileEvent, type FileEvent } from "./file-events";
-import { authenticate, fireTrigger, isApiTrigger, loadTriggerById, loadTriggerByToken, logTriggerEvent, type FireOutcome } from "./fire";
+import { authenticate, fireTrigger, isApiTrigger, loadTriggerById, loadTriggerByToken, logTriggerEvent, triggerSecret, type FireOutcome } from "./fire";
+import { deliverCallback, statusUrlOf, waitForRunResult } from "./results";
 import { dispatchQueued, environmentExists, startRun, type Bindings } from "./runs";
+import { checkReadAuth } from "./webhook";
 
 /** Largest request body accepted. The body becomes the run input. */
 const MAX_BODY_BYTES = 256 * 1024;
+
+/** Longest `?wait=` of `GET /wh/:token/runs/:runId`, in seconds. */
+const MAX_WAIT_SECONDS = 30;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -63,9 +70,9 @@ function hasApiToken(env: Bindings, header: string | undefined): boolean {
   return tokens.some((token) => sameSecret(header ?? "", `Bearer ${token}`));
 }
 
-/** The HTTP answer for what firing a trigger did. */
-function answer(outcome: FireOutcome): { body: Record<string, unknown>; status: 200 | 202 | 401 | 409 | 422 | 429 } {
-  if (outcome.kind === "started") return { body: { status: outcome.queued ? "queued" : "accepted", runId: outcome.runId, no: outcome.no }, status: 202 };
+/** The HTTP answer for what firing a trigger did. `statusUrl`: an API trigger's call, where the caller reads the result. */
+function answer(outcome: FireOutcome, statusUrl?: (runId: string) => string): { body: Record<string, unknown>; status: 200 | 202 | 401 | 409 | 422 | 429 } {
+  if (outcome.kind === "started") return { body: { status: outcome.queued ? "queued" : "accepted", runId: outcome.runId, no: outcome.no, ...(statusUrl ? { statusUrl: statusUrl(outcome.runId) } : {}) }, status: 202 };
   if (outcome.kind === "rejected") {
     if (outcome.reason === "filter_not_matched") return { body: { status: "ignored", reason: outcome.reason }, status: 200 };
     if (outcome.reason === "invalid_input") return { body: { status: "rejected", reason: outcome.reason, problems: outcome.problems }, status: 422 };
@@ -111,11 +118,40 @@ app.post("/wh/:token", async (c) => {
   const body = parseJsonObject(raw);
   if (!body.ok) return c.json({ error: body.error }, body.status);
 
-  const query = Object.fromEntries(new URL(c.req.url).searchParams);
-  // An API trigger may name its environment: `?env=staging`.
-  const outcome = await fireTrigger(sql, c.env, trigger, { body: body.value, headers: c.req.raw.headers, query, source: "webhook", env: isApiTrigger(trigger) ? (query.env ?? null) : null });
-  const { body: out, status } = answer(outcome);
+  const url = new URL(c.req.url);
+  const query = Object.fromEntries(url.searchParams);
+  const api = isApiTrigger(trigger);
+  // An API trigger may name its environment (`?env=staging`) and where its result goes (`X-Xaas-Callback-Url`).
+  const outcome = await fireTrigger(sql, c.env, trigger, {
+    body: body.value,
+    headers: c.req.raw.headers,
+    query,
+    source: "webhook",
+    env: api ? (query.env ?? null) : null,
+    callbackUrl: api ? (c.req.header("x-xaas-callback-url") ?? null) : null,
+  });
+  const { body: out, status } = answer(outcome, api ? (runId) => statusUrlOf(url.origin, c.req.param("token"), runId) : undefined);
   return c.json(out, status);
+});
+
+// The state and result of a run an API trigger started. `?wait=<1-30>` holds the answer until the run ends or that many
+// seconds pass. Same authentication as a call: bearer, or HMAC over `<timestamp>.GET.<path>` (`checkReadAuth`).
+app.get("/wh/:token/runs/:runId", async (c) => {
+  const sql = c.var.sql;
+  const token = c.req.param("token");
+  const runId = c.req.param("runId");
+  const trigger = await loadTriggerByToken(sql, token);
+  if (!trigger || !isApiTrigger(trigger) || !UUID.test(runId)) return c.json({ error: "not_found" }, 404);
+  const url = new URL(c.req.url);
+  const problem = await checkReadAuth({ mode: trigger.auth_mode, secret: await triggerSecret(c.env, trigger), method: "GET", path: url.pathname, headers: c.req.raw.headers });
+  if (problem) return c.json({ error: problem }, 401);
+
+  const wait = url.searchParams.get("wait");
+  const seconds = wait === null ? 0 : Number(wait);
+  if (!Number.isInteger(seconds) || seconds < 0 || seconds > MAX_WAIT_SECONDS) return c.json({ error: `wait_must_be_0_to_${MAX_WAIT_SECONDS}` }, 400);
+  const result = await waitForRunResult(sql, { triggerId: trigger.id, runId, statusUrl: statusUrlOf(url.origin, token, runId), seconds });
+  if (!result) return c.json({ error: "not_found" }, 404);
+  return c.json(result);
 });
 
 app.post("/internal/triggers/:id/fire", async (c) => {
@@ -134,14 +170,31 @@ app.post("/internal/triggers/:id/fire", async (c) => {
 app.post("/internal/events/run-finished", async (c) => {
   const checked = await verifiedQstashBody(c);
   if ("error" in checked) return c.json({ error: checked.error }, checked.status);
-  let runId: unknown;
+  let message: { runId?: unknown; callbackOnly?: unknown };
   try {
-    runId = (JSON.parse(checked.body) as { runId?: unknown }).runId;
+    message = JSON.parse(checked.body) as typeof message;
   } catch {
     return c.json({ error: "invalid_json" }, 400);
   }
+  const runId = message.runId;
   if (typeof runId !== "string" || !UUID.test(runId)) return c.json({ error: "runId_must_be_a_uuid" }, 400);
-  return c.json(await handleRunFinished(c.var.sql, c.env, runId));
+  return c.json(await handleRunFinished(c.var.sql, c.env, runId, { ingressOrigin: new URL(c.req.url).origin, callbackOnly: message.callbackOnly === true }));
+});
+
+// One attempt to POST the result of a run to its callback URL (`results.ts`); QStash retries a 502.
+app.post("/internal/callbacks/deliver", async (c) => {
+  const checked = await verifiedQstashBody(c);
+  if ("error" in checked) return c.json({ error: checked.error }, checked.status);
+  let callbackId: unknown;
+  try {
+    callbackId = (JSON.parse(checked.body) as { callbackId?: unknown }).callbackId;
+  } catch {
+    return c.json({ error: "invalid_json" }, 400);
+  }
+  if (typeof callbackId !== "string" || !UUID.test(callbackId)) return c.json({ error: "callbackId_must_be_a_uuid" }, 400);
+  const retried = Number(c.req.header("upstash-retried") ?? "0");
+  const delivery = await deliverCallback(c.var.sql, c.env, { callbackId, ingressOrigin: new URL(c.req.url).origin, retried: Number.isFinite(retried) ? retried : 0 });
+  return c.json(delivery.body, delivery.status);
 });
 
 app.post("/internal/events/file", async (c) => {

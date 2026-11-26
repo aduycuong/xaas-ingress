@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { decryptSecret, signBody } from "./crypto";
-import { buildInput, callScope, checkAuth, passesFilter, safeHeaders } from "./webhook";
+import { buildInput, callScope, checkAuth, checkReadAuth, passesFilter, safeHeaders } from "./webhook";
 
 const KEY = Buffer.alloc(32, 7).toString("base64");
 
@@ -63,4 +63,38 @@ test("input mapping: fixed values keep their type (text, number, boolean, JSON),
 test("credentials never reach the filter scope", () => {
   const headers = safeHeaders(new Headers({ Authorization: "Bearer x", "X-XaaS-Signature": "sha256=1", "X-Event": "post", Cookie: "a=b" }));
   assert.deepEqual(headers, { "x-event": "post" });
+});
+
+test("HMAC with X-Xaas-Timestamp: signs `<timestamp>.<body>`, and only within 5 minutes", async () => {
+  const body = '{"a":1}';
+  const now = 1_764_123_456_000;
+  const ts = String(now / 1000);
+  const good = await signBody("s3cret", `${ts}.${body}`);
+  const check = (headers: Record<string, string>, at = now) => checkAuth({ mode: "hmac", secret: "s3cret", rawBody: body, headers: new Headers(headers), now: at });
+  assert.equal(await check({ "X-Xaas-Signature": good, "X-Xaas-Timestamp": ts }), null);
+  assert.equal(await check({ "X-Xaas-Signature": good, "X-Xaas-Timestamp": ts }, now + 299_000), null);
+  assert.equal(await check({ "X-Xaas-Signature": good, "X-Xaas-Timestamp": ts }, now + 301_000), "stale_signature");
+  // A changed timestamp breaks the signature; the body-only signature does not pass once a timestamp is sent.
+  assert.equal(await check({ "X-Xaas-Signature": good, "X-Xaas-Timestamp": String(now / 1000 + 1) }), "invalid_signature");
+  assert.equal(await check({ "X-Xaas-Signature": await signBody("s3cret", body), "X-Xaas-Timestamp": ts }), "invalid_signature");
+  assert.equal(await check({ "X-Xaas-Signature": good, "X-Xaas-Timestamp": "soon" }), "missing_auth");
+});
+
+test("reading a run: HMAC over `<timestamp>.GET.<path>` with a required timestamp; bearer as for a call", async () => {
+  const now = 1_764_123_456_000;
+  const ts = String(now / 1000);
+  const path = "/wh/tok123/runs/0193aaaa-0000-7000-8000-000000000000";
+  const good = await signBody("s3cret", `${ts}.GET.${path}`);
+  const read = (headers: Record<string, string>, at = now, p = path) => checkReadAuth({ mode: "hmac", secret: "s3cret", method: "GET", path: p, headers: new Headers(headers), now: at });
+  assert.equal(await read({ "X-Xaas-Signature": good, "X-Xaas-Timestamp": ts }), null);
+  assert.equal(await read({ "X-Xaas-Signature": good }), "missing_auth");
+  assert.equal(await read({ "X-Xaas-Signature": good, "X-Xaas-Timestamp": ts }, now + 301_000), "stale_signature");
+  assert.equal(await read({ "X-Xaas-Signature": good, "X-Xaas-Timestamp": ts }, now, "/wh/tok123/runs/0193bbbb-0000-7000-8000-000000000000"), "invalid_signature");
+  const bearer = (value: string) => checkReadAuth({ mode: "bearer", secret: "tok", method: "GET", path, headers: new Headers({ Authorization: value }) });
+  assert.equal(await bearer("Bearer tok"), null);
+  assert.equal(await bearer("Bearer nope"), "invalid_signature");
+});
+
+test("the timestamp header never reaches the filter scope", () => {
+  assert.deepEqual(safeHeaders(new Headers({ "X-Xaas-Timestamp": "1", "X-Other": "y" })), { "x-other": "y" });
 });

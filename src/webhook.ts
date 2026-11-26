@@ -4,20 +4,58 @@ import { sameSecret, signBody } from "./crypto";
 import { evaluateIf, ExpressionError, resolveValue, type IfNode, type Scope } from "./graph";
 
 export type AuthMode = "none" | "hmac" | "bearer";
-export type AuthProblem = "missing_auth" | "invalid_signature";
+export type AuthProblem = "missing_auth" | "invalid_signature" | "stale_signature";
 
-/** `null` when the call is allowed, otherwise why it is not. HMAC covers the raw body; bearer is the secret itself. */
-export async function checkAuth(params: { mode: AuthMode; secret: string | null; rawBody: string; headers: Headers }): Promise<AuthProblem | null> {
+/** How far `X-Xaas-Timestamp` may be from the ingress clock, in seconds. */
+export const SIGNATURE_TOLERANCE_SECONDS = 300;
+
+/** A timestamp header (Unix seconds) within the tolerance, or the problem with it. */
+function checkTimestamp(value: string | null, now: number): AuthProblem | null {
+  if (!value || !/^\d{1,12}$/.test(value.trim())) return "missing_auth";
+  return Math.abs(now / 1000 - Number(value.trim())) > SIGNATURE_TOLERANCE_SECONDS ? "stale_signature" : null;
+}
+
+async function sameSignature(given: string, secret: string, signed: string): Promise<boolean> {
+  return sameSecret(given.trim().toLowerCase(), await signBody(secret, signed));
+}
+
+/**
+ * `null` when the call is allowed, otherwise why it is not. Bearer is the secret itself. HMAC covers the raw body, or,
+ * when the caller sends `X-Xaas-Timestamp`, `<timestamp>.<raw body>` (a copied call then works for a few minutes only).
+ */
+export async function checkAuth(params: { mode: AuthMode; secret: string | null; rawBody: string; headers: Headers; now?: number }): Promise<AuthProblem | null> {
   if (params.mode === "none") return null;
   if (!params.secret) return "invalid_signature";
-  if (params.mode === "bearer") {
-    const given = params.headers.get("authorization");
-    if (!given) return "missing_auth";
-    return sameSecret(given, `Bearer ${params.secret}`) ? null : "invalid_signature";
-  }
+  if (params.mode === "bearer") return checkBearer(params.secret, params.headers);
   const given = params.headers.get("x-xaas-signature");
   if (!given) return "missing_auth";
-  return sameSecret(given.trim().toLowerCase(), await signBody(params.secret, params.rawBody)) ? null : "invalid_signature";
+  const timestamp = params.headers.get("x-xaas-timestamp");
+  if (timestamp === null) return (await sameSignature(given, params.secret, params.rawBody)) ? null : "invalid_signature";
+  const problem = checkTimestamp(timestamp, params.now ?? Date.now());
+  if (problem) return problem;
+  return (await sameSignature(given, params.secret, `${timestamp.trim()}.${params.rawBody}`)) ? null : "invalid_signature";
+}
+
+/**
+ * The same check for a read (`GET /wh/:token/runs/:runId`): bearer as for a call; HMAC signs `<timestamp>.GET.<path>`, and
+ * the timestamp is required (a read has no body, so without it the signature would never change).
+ */
+export async function checkReadAuth(params: { mode: AuthMode; secret: string | null; method: string; path: string; headers: Headers; now?: number }): Promise<AuthProblem | null> {
+  if (params.mode === "none") return null;
+  if (!params.secret) return "invalid_signature";
+  if (params.mode === "bearer") return checkBearer(params.secret, params.headers);
+  const given = params.headers.get("x-xaas-signature");
+  const timestamp = params.headers.get("x-xaas-timestamp");
+  if (!given || timestamp === null) return "missing_auth";
+  const problem = checkTimestamp(timestamp, params.now ?? Date.now());
+  if (problem) return problem;
+  return (await sameSignature(given, params.secret, `${timestamp.trim()}.${params.method.toUpperCase()}.${params.path}`)) ? null : "invalid_signature";
+}
+
+function checkBearer(secret: string, headers: Headers): AuthProblem | null {
+  const given = headers.get("authorization");
+  if (!given) return "missing_auth";
+  return sameSecret(given, `Bearer ${secret}`) ? null : "invalid_signature";
 }
 
 /** The raw data of a call, as `{{ trigger… }}` reads it. A schedule adds `scheduledAt` (the time it fired, ISO). */
@@ -62,7 +100,7 @@ export function safeHeaders(headers: Headers): Record<string, string> {
   const out: Record<string, string> = {};
   headers.forEach((value, name) => {
     const key = name.toLowerCase();
-    if (!["authorization", "x-xaas-signature", "cookie"].includes(key)) out[key] = value;
+    if (!["authorization", "x-xaas-signature", "x-xaas-timestamp", "cookie"].includes(key)) out[key] = value;
   });
   return out;
 }
