@@ -191,7 +191,7 @@ Sau khi deploy, trỏ webhook Page của app Facebook về đây một lần, t�
 
 ### Kết quả của trigger `api` (`src/results.ts`, `src/callback-target.ts`)
 
-- Câu trả lời 202 có `statusUrl` (`/wh/:token/runs/:runId`). `GET` trả `{ runId, no, status, env, createdAt, startedAt, finishedAt, output, error, statusUrl }`; chỉ run thật của chính trigger đó (run test, run của trigger khác: 404).
+- Câu trả lời 202 có `statusUrl` (`/wh/:token/runs/:runId`). `GET` trả `{ runId, no, version, status, env, createdAt, startedAt, finishedAt, output, error, nodes, statusUrl }`; `nodes[]` là các node run đã tới (`{ id, label, type, status, startedAt, finishedAt, error }`, `id` là id của node trong graph của `version`), không có output của node; chỉ run thật của chính trigger đó (run test, run của trigger khác: 404).
 - **Result callback** (`triggers.callback_*`): URL mặc định, hoặc header `X-Xaas-Callback-Url` khi origin nằm trong `callback_allowed_origins` (`https://*.host` khớp subdomain). Callback tắt mà gọi có header: `422 callbacks_off`; origin không được phép: `422 callback_url_not_allowed`. URL được chốt lúc nhận lời gọi: dòng `run_callbacks` tạo cùng transaction với run.
 - Khi run kết thúc, `run-finished` chuyển `run_callbacks` từ `waiting` sang `sending` (một lần) và publish QStash tới `/internal/callbacks/deliver`, 3 lần thử lại. Mỗi lần thử ký lại: `X-Xaas-Timestamp` + `X-Xaas-Signature: sha256=<hex HMAC(secret của trigger, "<timestamp>.<body>")>`, cùng `X-Xaas-Event`, `X-Xaas-Delivery-Id`, `X-Xaas-Run-Id`; không theo redirect, timeout 15 s. Output trên 64 KB bị bỏ (`outputOmitted: true`).
 

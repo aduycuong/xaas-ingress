@@ -17,9 +17,26 @@ export const MAX_CALLBACK_OUTPUT_BYTES = 64 * 1024;
 /** How long one delivery waits for the receiver to answer. */
 const CALLBACK_TIMEOUT_MS = 15_000;
 
+/**
+ * One node the run reached. `id` is the node's id in the graph of the run's version (`definition.nodes[].id`, as the
+ * integration guide of that version lists it), `label` its name there. Nodes the run has not reached (or never will, on a
+ * branch not taken) are not listed. No output: only the run's own `output` leaves XAAS.
+ */
+export type RunNode = {
+  id: string;
+  label: string | null;
+  type: string;
+  status: "running" | "succeeded" | "warning" | "failed" | "skipped" | "cancelled";
+  startedAt: string;
+  finishedAt: string | null;
+  error: { code: string; message: string } | null;
+};
+
 export type RunResult = {
   runId: string;
   no: number;
+  /** Version of the workflow the run uses: its integration guide names the same node ids. */
+  version: number;
   status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
   env: string;
   createdAt: string;
@@ -28,10 +45,25 @@ export type RunResult = {
   /** What the workflow returned; null until it succeeds. */
   output: unknown;
   error: { code: string; message: string } | null;
+  nodes: RunNode[];
   statusUrl: string;
 };
 
-type RunRow = { id: string; no: number; status: RunResult["status"]; env: string; created_at: Date | string; started_at: Date | string | null; finished_at: Date | string | null; output: unknown; error: { code?: string; message?: string } | null };
+type StoredError = { code?: string; message?: string } | null;
+type RunRow = { id: string; no: number; version: number; status: RunResult["status"]; env: string; created_at: Date | string; started_at: Date | string | null; finished_at: Date | string | null; output: unknown; error: StoredError };
+type NodeRow = { node_id: string; label: string | null; node_type: string; status: RunNode["status"]; started_at: Date | string; finished_at: Date | string | null; error: StoredError };
+
+const publicError = (error: StoredError) => (error ? { code: error.code ?? "ERROR", message: error.message ?? "" } : null);
+
+export function toRunNode(row: NodeRow): RunNode {
+  return { id: row.node_id, label: row.label, type: row.node_type, status: row.status, startedAt: iso(row.started_at) as string, finishedAt: iso(row.finished_at), error: publicError(row.error) };
+}
+
+/** The nodes a run has reached, in the order they started. */
+async function loadRunNodes(sql: Sql, runId: string): Promise<RunNode[]> {
+  const rows = await sql`select node_id, label, node_type, status, started_at, finished_at, error from node_runs where run_id = ${runId}::uuid order by started_at, node_id`;
+  return (rows as NodeRow[]).map(toRunNode);
+}
 
 const iso = (value: Date | string | null) => (value === null ? null : new Date(value).toISOString());
 
@@ -39,17 +71,19 @@ export const isEnded = (status: string) => (ENDED_STATUSES as readonly string[])
 
 export const statusUrlOf = (origin: string, token: string, runId: string) => `${origin.replace(/\/$/, "")}/wh/${token}/runs/${runId}`;
 
-export function toRunResult(row: RunRow, statusUrl: string): RunResult {
+export function toRunResult(row: RunRow, nodes: RunNode[], statusUrl: string): RunResult {
   return {
     runId: row.id,
     no: Number(row.no),
+    version: Number(row.version),
     status: row.status,
     env: row.env,
     createdAt: iso(row.created_at) as string,
     startedAt: iso(row.started_at),
     finishedAt: iso(row.finished_at),
     output: row.status === "succeeded" ? (row.output ?? null) : null,
-    error: row.error ? { code: row.error.code ?? "ERROR", message: row.error.message ?? "" } : null,
+    error: publicError(row.error),
+    nodes,
     statusUrl,
   };
 }
@@ -64,22 +98,24 @@ export function callbackBody(result: RunResult, event: string): string {
 /** A real run of this trigger (test runs and runs of other triggers are not found), as its caller sees it. */
 export async function loadRunResult(sql: Sql, params: { triggerId: string; runId: string; statusUrl: string }): Promise<RunResult | null> {
   const [row] = await sql`
-    select id, no, status, env, created_at, started_at, finished_at, output, error from runs
-    where id = ${params.runId}::uuid and trigger_id = ${params.triggerId}::uuid and test is null`;
-  return row ? toRunResult(row as RunRow, params.statusUrl) : null;
+    select r.id, r.no, v.version, r.status, r.env, r.created_at, r.started_at, r.finished_at, r.output, r.error
+    from runs r join workflow_versions v on v.id = r.workflow_version_id
+    where r.id = ${params.runId}::uuid and r.trigger_id = ${params.triggerId}::uuid and r.test is null`;
+  return row ? toRunResult(row as RunRow, await loadRunNodes(sql, params.runId), params.statusUrl) : null;
 }
 
 /**
- * Waits until the run has ended or `seconds` passed, reading it once a second, then answers its result.
+ * Waits until the run has ended or `seconds` passed, reading its status once a second, then answers its result.
  * `seconds` 0 reads once.
  */
 export async function waitForRunResult(sql: Sql, params: { triggerId: string; runId: string; statusUrl: string; seconds: number }): Promise<RunResult | null> {
   const deadline = Date.now() + params.seconds * 1000;
-  for (;;) {
-    const result = await loadRunResult(sql, params);
-    if (!result || isEnded(result.status) || Date.now() + 1000 > deadline) return result;
+  while (Date.now() + 1000 <= deadline) {
+    const [row] = await sql`select status from runs where id = ${params.runId}::uuid and trigger_id = ${params.triggerId}::uuid and test is null`;
+    if (!row || isEnded(String(row.status))) break;
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
+  return loadRunResult(sql, params);
 }
 
 /**
@@ -117,8 +153,9 @@ export type DeliveryAnswer = { status: 200 | 502; body: Record<string, unknown> 
 export async function deliverCallback(sql: Sql, env: Bindings, params: { callbackId: string; ingressOrigin: string; retried: number; now?: number }): Promise<DeliveryAnswer> {
   const [row] = await sql`
     select c.id, c.url, c.status as callback_status, c.event, t.auth_secret, t.webhook_token,
-      r.id as run_id, r.no, r.status, r.env, r.created_at, r.started_at, r.finished_at, r.output, r.error
-    from run_callbacks c join runs r on r.id = c.run_id left join triggers t on t.id = c.trigger_id
+      r.id as run_id, r.no, v.version, r.status, r.env, r.created_at, r.started_at, r.finished_at, r.output, r.error
+    from run_callbacks c join runs r on r.id = c.run_id join workflow_versions v on v.id = r.workflow_version_id
+      left join triggers t on t.id = c.trigger_id
     where c.id = ${params.callbackId}::uuid`;
   if (!row || row.callback_status !== "sending") return { status: 200, body: { skipped: row ? row.callback_status : "not_found" } };
 
@@ -139,7 +176,7 @@ export async function deliverCallback(sql: Sql, env: Bindings, params: { callbac
     return { status: 200, body: { status: "failed" } };
   }
 
-  const result = toRunResult({ ...row, id: row.run_id } as RunRow, statusUrlOf(params.ingressOrigin, row.webhook_token, row.run_id));
+  const result = toRunResult({ ...row, id: row.run_id } as RunRow, await loadRunNodes(sql, row.run_id), statusUrlOf(params.ingressOrigin, row.webhook_token, row.run_id));
   const body = callbackBody(result, row.event ?? `run.${row.status}`);
   const timestamp = String(Math.floor((params.now ?? Date.now()) / 1000));
   const headers = {
