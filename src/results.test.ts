@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { callbackBody, MAX_CALLBACK_OUTPUT_BYTES, statusUrlOf, toRunNode, toRunResult, whereRunIs } from "./results";
+import { deliveryBody, MAX_DELIVERY_OUTPUT_BYTES } from "./deliveries";
+import { statusUrlOf, toRunNode, toRunResult, whereRunIs } from "./results";
 
 const row = { id: "0193aaaa-0000-7000-8000-000000000000", no: 42, version: 3, status: "succeeded" as const, env: "production", created_at: new Date("2026-11-26T08:00:00Z"), started_at: "2026-11-26T08:00:01Z", finished_at: new Date("2026-11-26T08:00:12Z"), output: { ok: true }, error: null };
 
@@ -27,15 +28,17 @@ test("a run as its caller sees it", () => {
   assert.deepEqual(failed.error, { code: "NODE_FAILED", message: "boom" });
 });
 
-test("a callback carries the event, the result and its nodes; a too large output is left out", () => {
+test("an event carries its meta and the run with its nodes; a too large output is left out", () => {
+  const meta = { event: "run.finished" as const, seq: 2, deliveryId: "d1", occurredAt: "2026-11-27T09:14:09.000Z", endpoint: "cb1", workflow: { id: "w1", slug: "lead-sync" }, triggerId: null };
   const result = toRunResult(row, nodes, "https://i/wh/t/runs/r");
-  assert.deepEqual(JSON.parse(callbackBody(result, "run.succeeded")), { event: "run.succeeded", ...result });
-  const big = toRunResult({ ...row, output: { text: "x".repeat(MAX_CALLBACK_OUTPUT_BYTES) } }, nodes, "https://i/wh/t/runs/r");
-  const body = JSON.parse(callbackBody(big, "run.succeeded"));
-  assert.equal(body.output, null);
-  assert.equal(body.outputOmitted, true);
-  assert.equal(body.nodes.length, 2);
-  assert.equal(body.statusUrl, "https://i/wh/t/runs/r");
+  assert.deepEqual(JSON.parse(deliveryBody(meta, result)), { ...meta, run: result });
+  const big = toRunResult({ ...row, output: { text: "x".repeat(MAX_DELIVERY_OUTPUT_BYTES) } }, nodes, null);
+  const body = JSON.parse(deliveryBody(meta, big));
+  assert.equal(body.run.output, null);
+  assert.equal(body.run.outputOmitted, true);
+  assert.equal(body.run.nodes.length, 2);
+  assert.equal(body.run.statusUrl, null);
+  assert.equal(body.seq, 2);
 });
 
 test("where a run is: the nodes running now, and what it waits for (an async node; a person for human.*)", () => {

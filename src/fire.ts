@@ -39,16 +39,15 @@ export type TriggerRow = {
   max_active_runs: number | null;
   /** Runs that may wait for a slot; past it a call that would queue is rejected (429). */
   queue_cap: number;
-  /** API triggers: the last segment of their URL, and where the results of their runs go (`callback-target.ts`). */
+  /** API triggers: the last segment of their URL. */
   webhook_token?: string | null;
-  callback_enabled?: boolean;
-  callback_url?: string | null;
-  callback_allowed_origins?: string[] | null;
+  /** The workflow's origins a call may name in `X-Xaas-Callback-Url` (`callback-target.ts`). */
+  callback_origins?: string[] | null;
 };
 
 export type FireOutcome =
   | { kind: "started"; runId: string; no: number; queued: boolean }
-  | { kind: "rejected"; reason: "invalid_signature" | "missing_auth" | "stale_signature" | "filter_not_matched" | "rate_limited" | "queue_full" | "unknown_environment" | "callbacks_off" | "callback_url_not_allowed"; status: 401 | 422 | 429 }
+  | { kind: "rejected"; reason: "invalid_signature" | "missing_auth" | "stale_signature" | "filter_not_matched" | "rate_limited" | "queue_full" | "unknown_environment" | "callback_url_not_allowed" | "callback_needs_secret"; status: 401 | 422 | 429 }
   /** The input (after the mapping) does not fit the input schema of the published version. */
   | { kind: "rejected"; reason: "invalid_input"; status: 422; problems: InputProblem[] }
   | { kind: "skipped"; reason: "trigger_disabled" | "workflow_not_active" | "already_running" | "loop_detected" };
@@ -57,7 +56,7 @@ export async function loadTriggerById(sql: Sql, id: string): Promise<TriggerRow 
   const [row] = await sql`
     select t.id, t.type, t.enabled, t.workspace_id, t.workflow_id, t.auth_mode, t.auth_secret, t.filter, t.input_mapping,
       t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, t.env, t.event_type, t.webhook_token,
-      t.callback_enabled, t.callback_url, t.callback_allowed_origins, w.status as workflow_status, w.current_version_id,
+      w.callback_allowed_origins as callback_origins, w.status as workflow_status, w.current_version_id,
       t.authentication_id, a.methods as auth_methods, a.rate_limit_per_minute as auth_rate_limit, t.when_full, w.max_active_runs, w.queue_cap
     from triggers t join workflows w on w.id = t.workflow_id left join authentications a on a.id = t.authentication_id where t.id = ${id}::uuid`;
   return (row as TriggerRow | undefined) ?? null;
@@ -67,7 +66,7 @@ export async function loadTriggerByToken(sql: Sql, token: string): Promise<Trigg
   const [row] = await sql`
     select t.id, t.type, t.enabled, t.workspace_id, t.workflow_id, t.auth_mode, t.auth_secret, t.filter, t.input_mapping,
       t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, t.env, t.webhook_token,
-      t.callback_enabled, t.callback_url, t.callback_allowed_origins, w.status as workflow_status, w.current_version_id,
+      w.callback_allowed_origins as callback_origins, w.status as workflow_status, w.current_version_id,
       t.authentication_id, a.methods as auth_methods, a.rate_limit_per_minute as auth_rate_limit, t.when_full, w.max_active_runs, w.queue_cap
     from triggers t join workflows w on w.id = t.workflow_id left join authentications a on a.id = t.authentication_id
     where t.webhook_token = ${token} and t.type in ('webhook', 'api', 'manual')`;
@@ -163,7 +162,7 @@ export type Call = {
   causeFileId?: string | null;
   /** The environment an API trigger's caller asked for (`?env=` or `env` in "Fire now"); other triggers use their own. */
   env?: string | null;
-  /** API triggers: where the caller asked the result to go (`X-Xaas-Callback-Url`); checked against the allowed origins. */
+  /** API and webhook calls: where the caller asked its run's events to go (`X-Xaas-Callback-Url`); checked against the workflow's allowed origins. */
   callbackUrl?: string | null;
   /** The authentication the call came with (`authenticate`), kept on the run. */
   authenticationId?: string | null;
@@ -204,10 +203,12 @@ export async function fireTrigger(sql: Sql, env: Bindings, trigger: TriggerRow, 
   const runEnv = isApiTrigger(trigger) ? (call.env || "production") : (trigger.env || "production");
   if (isApiTrigger(trigger) && call.env && !(await environmentExists(sql, trigger.workspace_id, call.env))) return reject("unknown_environment", 422);
 
-  // Where the result goes, decided now: a later change of the trigger does not move the result of a run already accepted.
+  // The URL the call names for its run's events, decided now: a later change of the allowed origins does not move the
+  // events of a run already accepted. Signed with the authentication the call came with, so it needs one with a secret.
   let callbackUrl: string | null = null;
-  if (isApiTrigger(trigger)) {
-    const target = resolveCallbackTarget({ enabled: Boolean(trigger.callback_enabled), url: trigger.callback_url ?? null, allowedOrigins: trigger.callback_allowed_origins ?? [] }, call.callbackUrl);
+  if (http) {
+    const canSign = Boolean(call.authenticationId) && !(trigger.auth_methods ?? []).includes("none");
+    const target = resolveCallbackTarget(trigger.callback_origins ?? [], call.callbackUrl, canSign);
     if (!target.ok) return reject(target.reason, 422);
     callbackUrl = target.url;
   }

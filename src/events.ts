@@ -4,7 +4,7 @@
 
 import { type TriggerRow, fireTrigger, logTriggerEvent } from "./fire";
 import { dispatchQueued, type Bindings, type Sql } from "./runs";
-import { scheduleCallback } from "./results";
+import { scheduleDeliveries } from "./deliveries";
 
 /** Longest chain of runs caused by one another before the next link is refused. */
 export const MAX_EVENT_DEPTH = 5;
@@ -17,7 +17,7 @@ export function chainBlocks(chain: { workflow_id: string }[], targetWorkflowId: 
 
 /**
  * `callbackOnly`: the app ended the run itself (cancelled it, or the stuck sweep failed it) and already gave its slot
- * away; only the result callback is left to send.
+ * away; only the `run.finished` events of its status callbacks are left to send.
  */
 export async function handleRunFinished(
   sql: Sql,
@@ -25,8 +25,9 @@ export async function handleRunFinished(
   runId: string,
   options: { ingressOrigin: string; callbackOnly?: boolean },
 ): Promise<{ queuedStarted: number; fired: number; blocked: number; callback: boolean }> {
-  // The caller of an API trigger waiting for the result first: it does not depend on anything below.
-  const callback = await scheduleCallback(sql, env, { runId, ingressOrigin: options.ingressOrigin });
+  // The status callbacks waiting for the result first: they do not depend on anything below. A failure to hand them over
+  // throws, so QStash retries this message (what was handed over is not sent twice).
+  const callback = (await scheduleDeliveries(sql, env, { runId, event: "run.finished", origin: env.PUBLIC_URL || options.ingressOrigin })) > 0;
   if (options.callbackOnly) return { queuedStarted: 0, fired: 0, blocked: 0, callback };
 
   const [run] = await sql`
@@ -42,7 +43,7 @@ export async function handleRunFinished(
   const triggers = (await sql`
     select t.id, t.type, t.enabled, t.workspace_id, t.workflow_id, t.auth_mode, t.auth_secret, t.filter, t.input_mapping,
       t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, t.env, w.status as workflow_status, w.current_version_id,
-      t.when_full, w.max_active_runs, w.queue_cap
+      t.when_full, w.max_active_runs, w.queue_cap, w.callback_allowed_origins as callback_origins
     from triggers t join workflows w on w.id = t.workflow_id
     where t.workspace_id = ${run.workspace_id}::uuid and t.type = 'event' and t.enabled
       and t.event_type = ${`run.${run.status}`} and (t.event_workflow_id is null or t.event_workflow_id = ${run.workflow_id}::uuid)`) as unknown as TriggerRow[];

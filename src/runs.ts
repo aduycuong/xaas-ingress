@@ -2,6 +2,7 @@
 // `queue_cap`, and the trigger's `when_full`) is applied here, under a per-workflow advisory lock, so two calls at the
 // same moment cannot both take the last slot. Runs of every trigger and of the Run button share the slots; editor tests do not.
 
+import { announceRunStarted } from "./deliveries";
 import { Client } from "@upstash/workflow";
 import type { Sql } from "./db";
 
@@ -16,6 +17,8 @@ export type Bindings = {
   QSTASH_URL?: string;
   QSTASH_CURRENT_SIGNING_KEY?: string;
   QSTASH_NEXT_SIGNING_KEY?: string;
+  /** Public URL of this Worker, without a trailing slash: where QStash delivers the events of status callbacks. */
+  PUBLIC_URL?: string;
   /** Signs the callback URLs of async nodes (the runner makes them, `POST /callbacks/...` checks them); same value as the runner. */
   CALLBACK_SIGNING_KEY?: string;
   /** Public URL of the runner Worker, without a trailing slash. */
@@ -76,7 +79,7 @@ export type NewRun = {
   concurrency?: { workflowId: string; whenFull: "queue" | "skip"; max: number | null; queueCap: number };
   /** The authentication the call came with (API and webhook triggers). */
   authenticationId?: string | null;
-  /** An API trigger with callbacks on: where the result is POSTed when the run ends (a `run_callbacks` row, made with the run). */
+  /** The URL an API or webhook call named for its run's events (`X-Xaas-Callback-Url`): a waiting `run.started` delivery, made with the run. */
   callbackUrl?: string | null;
 };
 
@@ -130,9 +133,10 @@ export async function insertRun(sql: Sql, run: NewRun): Promise<InsertedRun | nu
         ${run.env ?? "production"}, ${run.test ? JSON.stringify(run.test) : null}::jsonb, case when not (select f from full_) then now() end
       from counter
       returning id, no, dispatched_at`,
-    // In the same transaction, so the row exists before the run can end. Nothing when the run was not created.
+    // The URL the call named for its run's events, kept as a waiting `run.started` delivery (released when the run starts,
+    // `deliveries.ts`). In the same transaction, so it exists before the run can start. Nothing when the run was not created.
     ...(run.callbackUrl
-      ? [sql`insert into run_callbacks (id, run_id, workspace_id, trigger_id, url) select ${uuidv7()}, ${runId}, ${run.workspaceId}, ${run.triggerId}::uuid, ${run.callbackUrl} where exists (select 1 from runs where id = ${runId})`]
+      ? [sql`insert into run_deliveries (id, run_id, workspace_id, callback_id, url, event, seq, status) select ${uuidv7()}, ${runId}, ${run.workspaceId}, null, ${run.callbackUrl}, 'run.started', 1, 'waiting' where exists (select 1 from runs where id = ${runId})`]
       : []),
   ]);
   const row = inserted[0] as { id: string; no: number; dispatched_at: string | null } | undefined;
@@ -159,7 +163,10 @@ export async function handToRunner(sql: Sql, env: Bindings, runId: string): Prom
 /** Creates a run and, when it got a slot, hands it to the runner. */
 export async function startRun(sql: Sql, env: Bindings, run: NewRun): Promise<InsertedRun | null> {
   const inserted = await insertRun(sql, run);
-  if (inserted?.dispatched) await handToRunner(sql, env, inserted.runId);
+  if (inserted?.dispatched) {
+    await handToRunner(sql, env, inserted.runId);
+    await announceRunStarted(sql, env, inserted.runId);
+  }
   return inserted;
 }
 
@@ -186,6 +193,7 @@ export async function dispatchQueued(sql: Sql, env: Bindings, workflowId: string
     const row = claimed[0] as { id: string } | undefined;
     if (!row) break;
     await handToRunner(sql, env, row.id);
+    await announceRunStarted(sql, env, row.id);
     started++;
   }
   return started;

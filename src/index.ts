@@ -3,7 +3,7 @@
 //   GET  /wh/:token/runs/:runId              state and result of a run of an API trigger (`?wait=`; same authentication)
 //   POST /internal/triggers/:id/fire         QStash schedule of a cron trigger (Upstash signature)
 //   POST /internal/events/run-finished       QStash message from the runner (or the app) when a run ends (Upstash signature)
-//   POST /internal/callbacks/deliver         QStash: one attempt to POST a run's result to its callback URL (Upstash signature)
+//   POST /internal/callbacks/deliver         QStash: one attempt to POST an event of a run to a status callback (Upstash signature)
 //   POST /triggers/:id/fire                  "Fire now" from the xaas-workflows app (bearer token)
 //   POST /dispatch-queued                    the app's sweep: start queued runs whose workflow has a free slot (bearer token)
 //   POST /runs                               manual run from the xaas-workflows app (bearer token)
@@ -22,7 +22,8 @@ import { emitConnectionEvent, facebookEvents, facebookSignatureValid, learnTeleg
 import { handleRunFinished } from "./events";
 import { fileEvents, fireWithFile, handleFileEvent, type FileEvent } from "./file-events";
 import { authenticate, fireTrigger, isApiTrigger, loadTriggerById, loadTriggerByToken, logTriggerEvent, type FireOutcome } from "./fire";
-import { deliverCallback, statusUrlOf, waitForRunResult } from "./results";
+import { deliverRunEvent } from "./deliveries";
+import { statusUrlOf, waitForRunResult } from "./results";
 import { dispatchQueued, environmentExists, startRun, type Bindings } from "./runs";
 
 /** Largest request body accepted. The body becomes the run input. */
@@ -127,7 +128,7 @@ app.post("/wh/:token", async (c) => {
     query,
     source: "webhook",
     env: api ? (query.env ?? null) : null,
-    callbackUrl: api ? (c.req.header("x-xaas-callback-url") ?? null) : null,
+    callbackUrl: c.req.header("x-xaas-callback-url") ?? null,
     authenticationId,
   });
   const { body: out, status } = answer(outcome, api ? (runId) => statusUrlOf(url.origin, c.req.param("token"), runId) : undefined);
@@ -185,15 +186,16 @@ app.post("/internal/events/run-finished", async (c) => {
 app.post("/internal/callbacks/deliver", async (c) => {
   const checked = await verifiedQstashBody(c);
   if ("error" in checked) return c.json({ error: checked.error }, checked.status);
-  let callbackId: unknown;
+  let deliveryId: unknown;
   try {
-    callbackId = (JSON.parse(checked.body) as { callbackId?: unknown }).callbackId;
+    deliveryId = (JSON.parse(checked.body) as { deliveryId?: unknown }).deliveryId;
   } catch {
     return c.json({ error: "invalid_json" }, 400);
   }
-  if (typeof callbackId !== "string" || !UUID.test(callbackId)) return c.json({ error: "callbackId_must_be_a_uuid" }, 400);
+  // A message of the result callback before milestone 19 (`callbackId`) has nothing left to deliver.
+  if (typeof deliveryId !== "string" || !UUID.test(deliveryId)) return c.json({ skipped: "not_a_delivery" });
   const retried = Number(c.req.header("upstash-retried") ?? "0");
-  const delivery = await deliverCallback(c.var.sql, c.env, { callbackId, ingressOrigin: new URL(c.req.url).origin, retried: Number.isFinite(retried) ? retried : 0 });
+  const delivery = await deliverRunEvent(c.var.sql, c.env, { deliveryId, ingressOrigin: c.env.PUBLIC_URL || new URL(c.req.url).origin, retried: Number.isFinite(retried) ? retried : 0 });
   return c.json(delivery.body, delivery.status);
 });
 
