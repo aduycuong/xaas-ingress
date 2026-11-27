@@ -1,11 +1,10 @@
-// Where the result of an API trigger's run goes: the trigger's default URL, or the one a call names in
-// `X-Xaas-Callback-Url` when its origin is allowed (`triggers.callback_*` of the app). Pure, no I/O.
+// The URL a call of an API or webhook trigger names in `X-Xaas-Callback-Url` for its own run's events, on top of the
+// workflow's status callbacks: allowed when its origin is in the workflow's `callback_allowed_origins` (Workflow
+// settings of the app) and the call came with an authentication that has a secret to sign them. Pure, no I/O.
 
-export type CallbackSettings = { enabled: boolean; url: string | null; allowedOrigins: string[] };
+export type CallbackTarget = { ok: true; url: string | null } | { ok: false; reason: "callback_url_not_allowed" | "callback_needs_secret" };
 
-export type CallbackTarget = { ok: true; url: string | null } | { ok: false; reason: "callbacks_off" | "callback_url_not_allowed" };
-
-/** Longest callback URL accepted (the app allows the same for the default URL). */
+/** Longest callback URL accepted (the app allows the same for a status callback). */
 const MAX_URL_LENGTH = 2000;
 
 /**
@@ -32,11 +31,14 @@ export function callbackOriginAllowed(url: string, origins: readonly string[]): 
   });
 }
 
-/** The URL this call's result goes to (null: no callback), or why the call is refused. */
-export function resolveCallbackTarget(settings: CallbackSettings, requested: string | null | undefined): CallbackTarget {
+/**
+ * The URL this call's events go to (null: none asked), or why the call is refused. `canSign`: the call came with an
+ * authentication that has a secret (kind None cannot sign, and an unsigned event would not be trusted).
+ */
+export function resolveCallbackTarget(allowedOrigins: readonly string[], requested: string | null | undefined, canSign: boolean): CallbackTarget {
   const asked = requested?.trim();
-  if (!asked) return { ok: true, url: settings.enabled ? settings.url : null };
-  if (!settings.enabled) return { ok: false, reason: "callbacks_off" };
-  if (asked.length > MAX_URL_LENGTH || !callbackOriginAllowed(asked, settings.allowedOrigins)) return { ok: false, reason: "callback_url_not_allowed" };
+  if (!asked) return { ok: true, url: null };
+  if (asked.length > MAX_URL_LENGTH || !callbackOriginAllowed(asked, allowedOrigins)) return { ok: false, reason: "callback_url_not_allowed" };
+  if (!canSign) return { ok: false, reason: "callback_needs_secret" };
   return { ok: true, url: new URL(asked).toString() };
 }

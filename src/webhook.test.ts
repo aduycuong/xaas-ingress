@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { decryptSecret, signBody } from "./crypto";
-import { buildInput, callScope, checkAuth, checkReadAuth, passesFilter, safeHeaders } from "./webhook";
+import { buildInput, callScope, checkAuth, checkKeyAuth, checkReadAuth, keySigned, passesFilter, safeHeaders } from "./webhook";
 
 const KEY = Buffer.alloc(32, 7).toString("base64");
 
@@ -97,4 +97,47 @@ test("reading a run: HMAC over `<timestamp>.GET.<path>` with a required timestam
 
 test("the timestamp header never reaches the filter scope", () => {
   assert.deepEqual(safeHeaders(new Headers({ "X-Xaas-Timestamp": "1", "X-Other": "y" })), { "x-other": "y" });
+});
+
+// ---------- Authentications of the workspace ----------
+
+const KEYS: Record<string, string> = { xa_abc234: "s3cret-one", xa_def567: "s3cret-two" };
+const secretOf = async (keyId: string) => KEYS[keyId] ?? null;
+const NOW = Date.parse("2026-11-27T09:00:00Z");
+const TS = String(NOW / 1000);
+const keyCall = (methods: ("bearer" | "hmac" | "none")[], headers: Record<string, string>, extra: { path?: string; body?: string; method?: string } = {}) =>
+  checkKeyAuth({ methods, secretOf, method: extra.method ?? "POST", path: extra.path ?? "/wh/tok", rawBody: extra.body ?? '{"a":1}', headers: new Headers(headers), now: NOW });
+
+test("authentication None lets any call in", async () => {
+  assert.deepEqual(await keyCall(["none"], {}), { problem: null, keyId: null });
+});
+
+test("authentication bearer: <key id>.<secret> of a key of this authentication", async () => {
+  assert.deepEqual(await keyCall(["bearer"], { Authorization: "Bearer xa_abc234.s3cret-one" }), { problem: null, keyId: "xa_abc234" });
+  assert.deepEqual(await keyCall(["bearer", "hmac"], { Authorization: "Bearer xa_def567.s3cret-two" }), { problem: null, keyId: "xa_def567" });
+  assert.equal((await keyCall(["bearer"], { Authorization: "Bearer xa_abc234.s3cret-two" })).problem, "invalid_signature");
+  // A key that is not one of this authentication's (or revoked: `secretOf` gives null).
+  assert.equal((await keyCall(["bearer"], { Authorization: "Bearer xa_zzz999.s3cret-one" })).problem, "invalid_signature");
+  assert.equal((await keyCall(["bearer"], { Authorization: "Bearer s3cret-one" })).problem, "invalid_signature");
+  assert.equal((await keyCall(["hmac"], { Authorization: "Bearer xa_abc234.s3cret-one" })).problem, "invalid_signature");
+  assert.equal((await keyCall(["bearer"], {})).problem, "missing_auth");
+});
+
+test("authentication HMAC: signs <timestamp>.<METHOD>.<path>.<body> with the key named in X-Xaas-Key-Id", async () => {
+  const sign = (secret: string, path = "/wh/tok", body = '{"a":1}', method = "POST", ts = TS) => signBody(secret, keySigned(ts, method, path, body));
+  const ok = { "X-Xaas-Key-Id": "xa_abc234", "X-Xaas-Timestamp": TS, "X-Xaas-Signature": await sign("s3cret-one") };
+  assert.deepEqual(await keyCall(["hmac"], ok), { problem: null, keyId: "xa_abc234" });
+  // Another path (another trigger), another body, another key's secret, or bearer only: refused.
+  assert.equal((await keyCall(["hmac"], ok, { path: "/wh/other" })).problem, "invalid_signature");
+  assert.equal((await keyCall(["hmac"], ok, { body: '{"a":2}' })).problem, "invalid_signature");
+  assert.equal((await keyCall(["hmac"], { ...ok, "X-Xaas-Signature": await sign("s3cret-two") })).problem, "invalid_signature");
+  assert.equal((await keyCall(["bearer"], ok)).problem, "invalid_signature");
+  // The timestamp and the key id are required; an old timestamp is stale.
+  assert.equal((await keyCall(["hmac"], { "X-Xaas-Key-Id": "xa_abc234", "X-Xaas-Signature": ok["X-Xaas-Signature"] })).problem, "missing_auth");
+  assert.equal((await keyCall(["hmac"], { "X-Xaas-Timestamp": TS, "X-Xaas-Signature": ok["X-Xaas-Signature"] })).problem, "missing_auth");
+  const old = String(NOW / 1000 - 3600);
+  assert.equal((await keyCall(["hmac"], { ...ok, "X-Xaas-Timestamp": old, "X-Xaas-Signature": await sign("s3cret-one", "/wh/tok", '{"a":1}', "POST", old) })).problem, "stale_signature");
+  // A read signs GET and an empty body.
+  const read = { "X-Xaas-Key-Id": "xa_abc234", "X-Xaas-Timestamp": TS, "X-Xaas-Signature": await sign("s3cret-one", "/wh/tok/runs/r1", "", "GET") };
+  assert.deepEqual(await keyCall(["hmac"], read, { method: "GET", path: "/wh/tok/runs/r1", body: "" }), { problem: null, keyId: "xa_abc234" });
 });

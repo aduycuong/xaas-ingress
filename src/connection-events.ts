@@ -187,7 +187,8 @@ export async function sha256Hex(text: string): Promise<string> {
 // ---------- Handing events to triggers ----------
 
 const TRIGGER_COLUMNS = `t.id, t.type, t.enabled, t.workspace_id, t.workflow_id, t.auth_mode, t.auth_secret, t.filter, t.input_mapping,
-  t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, t.env, t.event_type, w.status as workflow_status, w.current_version_id`;
+  t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, t.env, t.event_type, w.status as workflow_status, w.current_version_id,
+  t.when_full, w.max_active_runs, w.queue_cap`;
 
 export type EmitResult = { duplicate: boolean; connections: number; fired: number };
 

@@ -1,11 +1,12 @@
 // Ingress Worker: every way a run is started from outside goes through here.
-//   POST /wh/:token                          webhook or API trigger (token in the URL, plus the trigger's own auth)
-//   GET  /wh/:token/runs/:runId              state and result of a run of an API trigger (`?wait=`; the trigger's auth)
+//   POST /wh/:token                          webhook or API trigger (token in the URL, plus its authentication)
+//   GET  /wh/:token/runs/:runId              state and result of a run of an API trigger (`?wait=`; same authentication)
 //   POST /internal/triggers/:id/fire         QStash schedule of a cron trigger (Upstash signature)
 //   POST /internal/events/run-finished       QStash message from the runner (or the app) when a run ends (Upstash signature)
-//   POST /internal/callbacks/deliver         QStash: one attempt to POST a run's result to its callback URL (Upstash signature)
+//   POST /internal/events/run-node           QStash message from the runner: the run reached another node (at most every 5 s per run)
+//   POST /internal/callbacks/deliver         QStash: one attempt to POST an event of a run to a status callback (Upstash signature)
 //   POST /triggers/:id/fire                  "Fire now" from the xaas-workflows app (bearer token)
-//   POST /dispatch-queued                    the app's sweep: start queued runs whose trigger has a free slot (bearer token)
+//   POST /dispatch-queued                    the app's sweep: start queued runs whose workflow has a free slot (bearer token)
 //   POST /runs                               manual run from the xaas-workflows app (bearer token)
 //   POST /callbacks/:nodeRunId/:attempt      result of an async node (signed URL the runner gave the node)
 //   POST /hooks/telegram/:botId              updates of a bot whose connection emits events (secret_token of setWebhook)
@@ -21,10 +22,10 @@ import { handleCallback } from "./callbacks";
 import { emitConnectionEvent, facebookEvents, facebookSignatureValid, learnTelegramChat, sha256Hex, telegramChatOf, telegramEvent, touchSubscription } from "./connection-events";
 import { handleRunFinished } from "./events";
 import { fileEvents, fireWithFile, handleFileEvent, type FileEvent } from "./file-events";
-import { authenticate, fireTrigger, isApiTrigger, loadTriggerById, loadTriggerByToken, logTriggerEvent, triggerSecret, type FireOutcome } from "./fire";
-import { deliverCallback, statusUrlOf, waitForRunResult } from "./results";
+import { authenticate, fireTrigger, isApiTrigger, loadTriggerById, loadTriggerByToken, logTriggerEvent, type FireOutcome } from "./fire";
+import { deliverRunEvent, scheduleDeliveries } from "./deliveries";
+import { statusUrlOf, waitForRunResult } from "./results";
 import { dispatchQueued, environmentExists, startRun, type Bindings } from "./runs";
-import { checkReadAuth } from "./webhook";
 
 /** Largest request body accepted. The body becomes the run input. */
 const MAX_BODY_BYTES = 256 * 1024;
@@ -110,7 +111,8 @@ app.post("/wh/:token", async (c) => {
   // The raw text is what a signature covers: read it once, check it, then parse.
   const raw = await c.req.text();
   if (raw.length > MAX_BODY_BYTES) return c.json({ error: "payload_too_large" }, 413);
-  const problem = await authenticate(c.env, trigger, raw, c.req.raw.headers);
+  const url = new URL(c.req.url);
+  const { problem, authenticationId } = await authenticate(sql, c.env, trigger, { method: "POST", path: url.pathname, rawBody: raw, headers: c.req.raw.headers });
   if (problem) {
     await logTriggerEvent(sql, trigger, "rejected", problem, null);
     return c.json({ error: problem }, 401);
@@ -118,7 +120,6 @@ app.post("/wh/:token", async (c) => {
   const body = parseJsonObject(raw);
   if (!body.ok) return c.json({ error: body.error }, body.status);
 
-  const url = new URL(c.req.url);
   const query = Object.fromEntries(url.searchParams);
   const api = isApiTrigger(trigger);
   // An API trigger may name its environment (`?env=staging`) and where its result goes (`X-Xaas-Callback-Url`).
@@ -128,14 +129,15 @@ app.post("/wh/:token", async (c) => {
     query,
     source: "webhook",
     env: api ? (query.env ?? null) : null,
-    callbackUrl: api ? (c.req.header("x-xaas-callback-url") ?? null) : null,
+    callbackUrl: c.req.header("x-xaas-callback-url") ?? null,
+    authenticationId,
   });
   const { body: out, status } = answer(outcome, api ? (runId) => statusUrlOf(url.origin, c.req.param("token"), runId) : undefined);
   return c.json(out, status);
 });
 
 // The state and result of a run an API trigger started. `?wait=<1-30>` holds the answer until the run ends or that many
-// seconds pass. Same authentication as a call: bearer, or HMAC over `<timestamp>.GET.<path>` (`checkReadAuth`).
+// seconds pass. Same authentication as a call: bearer, or HMAC over `<timestamp>.GET.<path>.` (an empty body; `authenticate`).
 app.get("/wh/:token/runs/:runId", async (c) => {
   const sql = c.var.sql;
   const token = c.req.param("token");
@@ -143,7 +145,7 @@ app.get("/wh/:token/runs/:runId", async (c) => {
   const trigger = await loadTriggerByToken(sql, token);
   if (!trigger || !isApiTrigger(trigger) || !UUID.test(runId)) return c.json({ error: "not_found" }, 404);
   const url = new URL(c.req.url);
-  const problem = await checkReadAuth({ mode: trigger.auth_mode, secret: await triggerSecret(c.env, trigger), method: "GET", path: url.pathname, headers: c.req.raw.headers });
+  const { problem } = await authenticate(sql, c.env, trigger, { method: "GET", path: url.pathname, rawBody: "", headers: c.req.raw.headers });
   if (problem) return c.json({ error: problem }, 401);
 
   const wait = url.searchParams.get("wait");
@@ -182,18 +184,38 @@ app.post("/internal/events/run-finished", async (c) => {
 });
 
 // One attempt to POST the result of a run to its callback URL (`results.ts`); QStash retries a 502.
-app.post("/internal/callbacks/deliver", async (c) => {
+// The runner reports that a run reached another node (or started waiting): `run.node` to the status callbacks that
+// follow nodes, carrying where the run is when this message arrives. Nothing once the run has ended (`run.finished` says it).
+app.post("/internal/events/run-node", async (c) => {
   const checked = await verifiedQstashBody(c);
   if ("error" in checked) return c.json({ error: checked.error }, checked.status);
-  let callbackId: unknown;
+  let runId: unknown;
   try {
-    callbackId = (JSON.parse(checked.body) as { callbackId?: unknown }).callbackId;
+    runId = (JSON.parse(checked.body) as { runId?: unknown }).runId;
   } catch {
     return c.json({ error: "invalid_json" }, 400);
   }
-  if (typeof callbackId !== "string" || !UUID.test(callbackId)) return c.json({ error: "callbackId_must_be_a_uuid" }, 400);
+  if (typeof runId !== "string" || !UUID.test(runId)) return c.json({ error: "runId_must_be_a_uuid" }, 400);
+  const sql = c.var.sql;
+  const [run] = await sql`select status from runs where id = ${runId}::uuid`;
+  if (!run || run.status !== "running") return c.json({ status: "not_running" });
+  const sent = await scheduleDeliveries(sql, c.env, { runId, event: "run.node", origin: c.env.PUBLIC_URL || new URL(c.req.url).origin });
+  return c.json({ status: "ok", sent });
+});
+
+app.post("/internal/callbacks/deliver", async (c) => {
+  const checked = await verifiedQstashBody(c);
+  if ("error" in checked) return c.json({ error: checked.error }, checked.status);
+  let deliveryId: unknown;
+  try {
+    deliveryId = (JSON.parse(checked.body) as { deliveryId?: unknown }).deliveryId;
+  } catch {
+    return c.json({ error: "invalid_json" }, 400);
+  }
+  // A message of the result callback before milestone 19 (`callbackId`) has nothing left to deliver.
+  if (typeof deliveryId !== "string" || !UUID.test(deliveryId)) return c.json({ skipped: "not_a_delivery" });
   const retried = Number(c.req.header("upstash-retried") ?? "0");
-  const delivery = await deliverCallback(c.var.sql, c.env, { callbackId, ingressOrigin: new URL(c.req.url).origin, retried: Number.isFinite(retried) ? retried : 0 });
+  const delivery = await deliverRunEvent(c.var.sql, c.env, { deliveryId, ingressOrigin: c.env.PUBLIC_URL || new URL(c.req.url).origin, retried: Number.isFinite(retried) ? retried : 0 });
   return c.json(delivery.body, delivery.status);
 });
 
@@ -316,11 +338,11 @@ app.post("/hooks/facebook", async (c) => {
 app.post("/dispatch-queued", async (c) => {
   if (!hasApiToken(c.env, c.req.header("authorization"))) return c.json({ error: "unauthorized" }, 401);
   const sql = c.var.sql;
-  // Triggers with runs waiting for a slot.
-  const waiting = (await sql`select distinct trigger_id from runs where status = 'queued' and dispatched_at is null and trigger_id is not null limit 200`) as unknown as { trigger_id: string }[];
+  // Workflows with runs waiting for a slot.
+  const waiting = (await sql`select distinct workflow_id from runs where status = 'queued' and dispatched_at is null and test is null limit 200`) as unknown as { workflow_id: string }[];
   let started = 0;
-  for (const { trigger_id } of waiting) started += await dispatchQueued(sql, c.env, trigger_id);
-  return c.json({ triggers: waiting.length, started });
+  for (const { workflow_id } of waiting) started += await dispatchQueued(sql, c.env, workflow_id);
+  return c.json({ workflows: waiting.length, started });
 });
 
 app.post("/runs", async (c) => {
@@ -352,7 +374,7 @@ app.post("/runs", async (c) => {
   const env = typeof body.value.env === "string" && body.value.env ? body.value.env : test ? "staging" : "production";
 
   const sql = c.var.sql;
-  const [workflow] = await sql`select workspace_id, current_version_id from workflows where id = ${workflowId}`;
+  const [workflow] = await sql`select workspace_id, current_version_id, max_active_runs, queue_cap from workflows where id = ${workflowId}`;
   if (!workflow) return c.json({ error: "not_found" }, 404);
   if (!(await environmentExists(sql, workflow.workspace_id, env))) return c.json({ error: "unknown_environment" }, 400);
   if (!workflow.current_version_id && !test) return c.json({ error: "workflow_not_published" }, 409);
@@ -373,8 +395,11 @@ app.post("/runs", async (c) => {
     triggeredBy,
     retryOf,
     env,
+    // A run from the Run button (or a retry) takes a slot of the workflow and always queues; an editor test takes none.
+    concurrency: test ? undefined : { workflowId, whenFull: "queue", max: workflow.max_active_runs === null ? null : Number(workflow.max_active_runs), queueCap: Number(workflow.queue_cap) },
   });
-  return c.json({ status: "accepted", runId: inserted?.runId }, 202);
+  if (!inserted) return c.json({ error: "queue_full" }, 429);
+  return c.json({ status: inserted.dispatched ? "accepted" : "queued", runId: inserted.runId }, 202);
 });
 
 export default app;

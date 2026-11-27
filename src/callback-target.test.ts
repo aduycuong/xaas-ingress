@@ -28,14 +28,14 @@ test("a wildcard matches subdomains, not the bare domain", () => {
   assert.equal(callbackOriginAllowed("https://badexample.com/x", origins), false);
 });
 
-test("resolving the target of a call", () => {
-  const on = { enabled: true, url: "https://hooks.example.com/default", allowedOrigins: ["https://app.example.com"] };
-  assert.deepEqual(resolveCallbackTarget(on, null), { ok: true, url: "https://hooks.example.com/default" });
-  assert.deepEqual(resolveCallbackTarget(on, "  "), { ok: true, url: "https://hooks.example.com/default" });
-  assert.deepEqual(resolveCallbackTarget(on, "https://app.example.com/r/1"), { ok: true, url: "https://app.example.com/r/1" });
-  assert.deepEqual(resolveCallbackTarget(on, "https://other.example.com/r/1"), { ok: false, reason: "callback_url_not_allowed" });
-  assert.deepEqual(resolveCallbackTarget({ ...on, url: null }, null), { ok: true, url: null });
-  const off = { ...on, enabled: false };
-  assert.deepEqual(resolveCallbackTarget(off, null), { ok: true, url: null });
-  assert.deepEqual(resolveCallbackTarget(off, "https://app.example.com/r/1"), { ok: false, reason: "callbacks_off" });
+test("resolving the URL a call names", () => {
+  const origins = ["https://app.example.com"];
+  assert.deepEqual(resolveCallbackTarget(origins, null, true), { ok: true, url: null });
+  assert.deepEqual(resolveCallbackTarget(origins, "  ", true), { ok: true, url: null });
+  assert.deepEqual(resolveCallbackTarget(origins, "https://app.example.com/r/1", true), { ok: true, url: "https://app.example.com/r/1" });
+  assert.deepEqual(resolveCallbackTarget(origins, "https://other.example.com/r/1", true), { ok: false, reason: "callback_url_not_allowed" });
+  assert.deepEqual(resolveCallbackTarget([], "https://app.example.com/r/1", true), { ok: false, reason: "callback_url_not_allowed" });
+  // Allowed origin, but nothing to sign with (an authentication of kind None).
+  assert.deepEqual(resolveCallbackTarget(origins, "https://app.example.com/r/1", false), { ok: false, reason: "callback_needs_secret" });
+  assert.deepEqual(resolveCallbackTarget(origins, null, false), { ok: true, url: null });
 });
