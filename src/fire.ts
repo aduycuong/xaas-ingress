@@ -4,7 +4,7 @@ import { decryptSecret } from "./crypto";
 import { resolveCallbackTarget } from "./callback-target";
 import { validateInput, type InputProblem } from "./input-schema";
 import { type Bindings, type Sql, environmentExists, startRun, uuidv7 } from "./runs";
-import { buildInput, callScope, checkAuth, checkKeyAuth, checkReadAuth, passesFilter, safeHeaders, type AuthMode, type AuthProblem, type CallParts, type Filter, type KeyMethod } from "./webhook";
+import { buildInput, callScope, checkKeyAuth, passesFilter, safeHeaders, type AuthProblem, type CallParts, type Filter, type KeyMethod } from "./webhook";
 
 export type TriggerRow = {
   id: string;
@@ -13,13 +13,8 @@ export type TriggerRow = {
   enabled: boolean;
   workspace_id: string;
   workflow_id: string;
-  auth_mode: AuthMode;
-  auth_secret: string | null;
   filter: Filter | null;
   input_mapping: Record<string, unknown> | null;
-  concurrency_policy: "parallel" | "skip" | "queue";
-  concurrency_max: number;
-  rate_limit_per_minute: number | null;
   /** Environment of the runs it starts; ignored for `api` (the caller chooses). */
   env: string | null;
   workflow_status: string;
@@ -28,7 +23,7 @@ export type TriggerRow = {
   event_type?: string | null;
   /**
    * API and webhook triggers (milestone 19): the authentication of the workspace callers use, its methods and rate limit.
-   * Null for a trigger of the old model (its own `auth_mode` / `auth_secret`), until the app drops those columns.
+   * Always set for them (a check constraint of the app); null for schedules and events.
    */
   authentication_id?: string | null;
   auth_methods?: KeyMethod[] | null;
@@ -54,8 +49,8 @@ export type FireOutcome =
 
 export async function loadTriggerById(sql: Sql, id: string): Promise<TriggerRow | null> {
   const [row] = await sql`
-    select t.id, t.type, t.enabled, t.workspace_id, t.workflow_id, t.auth_mode, t.auth_secret, t.filter, t.input_mapping,
-      t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, t.env, t.event_type, t.webhook_token,
+    select t.id, t.type, t.enabled, t.workspace_id, t.workflow_id, t.filter, t.input_mapping,
+      t.env, t.event_type, t.webhook_token,
       w.callback_allowed_origins as callback_origins, w.status as workflow_status, w.current_version_id,
       t.authentication_id, a.methods as auth_methods, a.rate_limit_per_minute as auth_rate_limit, t.when_full, w.max_active_runs, w.queue_cap
     from triggers t join workflows w on w.id = t.workflow_id left join authentications a on a.id = t.authentication_id where t.id = ${id}::uuid`;
@@ -64,8 +59,8 @@ export async function loadTriggerById(sql: Sql, id: string): Promise<TriggerRow 
 
 export async function loadTriggerByToken(sql: Sql, token: string): Promise<TriggerRow | null> {
   const [row] = await sql`
-    select t.id, t.type, t.enabled, t.workspace_id, t.workflow_id, t.auth_mode, t.auth_secret, t.filter, t.input_mapping,
-      t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, t.env, t.webhook_token,
+    select t.id, t.type, t.enabled, t.workspace_id, t.workflow_id, t.filter, t.input_mapping,
+      t.env, t.webhook_token,
       w.callback_allowed_origins as callback_origins, w.status as workflow_status, w.current_version_id,
       t.authentication_id, a.methods as auth_methods, a.rate_limit_per_minute as auth_rate_limit, t.when_full, w.max_active_runs, w.queue_cap
     from triggers t join workflows w on w.id = t.workflow_id left join authentications a on a.id = t.authentication_id
@@ -93,9 +88,9 @@ export async function logTriggerEvent(sql: Sql, trigger: Pick<TriggerRow, "id" |
 }
 
 /**
- * Who may call a webhook or API trigger. With an authentication of the workspace (milestone 19): its methods and secrets
- * (`checkKeyAuth`); the secret that passed gets its `last_used_at`. A trigger of the old model checks its own
- * `auth_mode` / `auth_secret` as before. `method` and `path` are the request's; a read (`GET`) has an empty body.
+ * Who may call a webhook or API trigger: the methods and secrets of the authentication of the workspace it uses
+ * (`checkKeyAuth`); the secret that passed gets its `last_used_at`. `method` and `path` are the request's; a read
+ * (`GET`) has an empty body. A trigger without an authentication (cannot happen: the app requires one) lets no one in.
  */
 export async function authenticate(sql: Sql, env: Bindings, trigger: TriggerRow, request: { method: string; path: string; rawBody: string; headers: Headers }): Promise<{ problem: AuthProblem | null; authenticationId: string | null }> {
   if (trigger.authentication_id) {
@@ -111,12 +106,7 @@ export async function authenticate(sql: Sql, env: Bindings, trigger: TriggerRow,
     if (!problem && keyId) await touchSecret(sql, keyId);
     return { problem, authenticationId: problem ? null : authenticationId };
   }
-  if (trigger.auth_mode === "none") return { problem: null, authenticationId: null };
-  const secret = await triggerSecret(env, trigger);
-  const problem = request.method.toUpperCase() === "GET"
-    ? await checkReadAuth({ mode: trigger.auth_mode, secret, method: "GET", path: request.path, headers: request.headers })
-    : await checkAuth({ mode: trigger.auth_mode, secret, rawBody: request.rawBody, headers: request.headers });
-  return { problem, authenticationId: null };
+  return { problem: "invalid_signature", authenticationId: null };
 }
 
 /** The secret of a key id of an authentication, in clear, when it is not revoked; null otherwise. */
@@ -137,16 +127,6 @@ async function touchSecret(sql: Sql, keyId: string): Promise<void> {
     await sql`update authentication_secrets set last_used_at = now() where key_id = ${keyId} and (last_used_at is null or last_used_at < now() - interval '1 minute')`;
   } catch (error) {
     console.warn("[ingress] could not record the use of a key", error);
-  }
-}
-
-/** The trigger's secret (HMAC key or bearer token) in clear, or null when it has none or it cannot be read. */
-export async function triggerSecret(env: Bindings, trigger: Pick<TriggerRow, "auth_secret">): Promise<string | null> {
-  if (!trigger.auth_secret || !env.TRIGGERS_ENCRYPTION_KEY) return null;
-  try {
-    return await decryptSecret(trigger.auth_secret, env.TRIGGERS_ENCRYPTION_KEY);
-  } catch {
-    return null;
   }
 }
 
@@ -186,17 +166,12 @@ export async function fireTrigger(sql: Sql, env: Bindings, trigger: TriggerRow, 
   if (trigger.workflow_status !== "active" || !trigger.current_version_id) return skip("workflow_not_active");
 
   const http = call.source === "webhook";
-  // The rate limit of the authentication counts the calls of every trigger that uses it; a trigger of the old model has its own.
+  // The rate limit of the authentication counts the calls of every trigger that uses it.
   if (http && trigger.authentication_id && trigger.auth_rate_limit) {
     const [recent] = await sql`
       select count(*)::int as n from trigger_events e join triggers t on t.id = e.trigger_id
       where t.authentication_id = ${trigger.authentication_id}::uuid and e.created_at > now() - interval '1 minute' and e.outcome in ('fired', 'skipped')`;
     if (Number(recent?.n ?? 0) >= trigger.auth_rate_limit) return reject("rate_limited", 429);
-  } else if (http && !trigger.authentication_id && trigger.rate_limit_per_minute) {
-    const [recent] = await sql`
-      select count(*)::int as n from trigger_events
-      where trigger_id = ${trigger.id}::uuid and created_at > now() - interval '1 minute' and outcome in ('fired', 'skipped')`;
-    if (Number(recent?.n ?? 0) >= trigger.rate_limit_per_minute) return reject("rate_limited", 429);
   }
 
   // An API trigger runs where the caller asks (production by default); the others where they are set.

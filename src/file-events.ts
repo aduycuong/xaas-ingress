@@ -39,8 +39,8 @@ function payloadOf(event: FileEvent, file: FileRow) {
   };
 }
 
-const TRIGGER_COLUMNS = `t.id, t.type, t.enabled, t.workspace_id, t.workflow_id, t.auth_mode, t.auth_secret, t.filter, t.input_mapping,
-  t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, t.env, t.path_pattern, w.status as workflow_status, w.current_version_id,
+const TRIGGER_COLUMNS = `t.id, t.type, t.enabled, t.workspace_id, t.workflow_id, t.filter, t.input_mapping,
+  t.env, t.path_pattern, w.status as workflow_status, w.current_version_id,
   t.when_full, w.max_active_runs, w.queue_cap`;
 
 export async function handleFileEvent(sql: Sql, env: Bindings, message: { fileId: string; event: FileEvent; causeRunId: string | null }): Promise<{ fired: number; blocked: number; matched: number }> {
