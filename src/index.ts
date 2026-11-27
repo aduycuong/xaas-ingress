@@ -3,6 +3,7 @@
 //   GET  /wh/:token/runs/:runId              state and result of a run of an API trigger (`?wait=`; same authentication)
 //   POST /internal/triggers/:id/fire         QStash schedule of a cron trigger (Upstash signature)
 //   POST /internal/events/run-finished       QStash message from the runner (or the app) when a run ends (Upstash signature)
+//   POST /internal/events/run-node           QStash message from the runner: the run reached another node (at most every 5 s per run)
 //   POST /internal/callbacks/deliver         QStash: one attempt to POST an event of a run to a status callback (Upstash signature)
 //   POST /triggers/:id/fire                  "Fire now" from the xaas-workflows app (bearer token)
 //   POST /dispatch-queued                    the app's sweep: start queued runs whose workflow has a free slot (bearer token)
@@ -22,7 +23,7 @@ import { emitConnectionEvent, facebookEvents, facebookSignatureValid, learnTeleg
 import { handleRunFinished } from "./events";
 import { fileEvents, fireWithFile, handleFileEvent, type FileEvent } from "./file-events";
 import { authenticate, fireTrigger, isApiTrigger, loadTriggerById, loadTriggerByToken, logTriggerEvent, type FireOutcome } from "./fire";
-import { deliverRunEvent } from "./deliveries";
+import { deliverRunEvent, scheduleDeliveries } from "./deliveries";
 import { statusUrlOf, waitForRunResult } from "./results";
 import { dispatchQueued, environmentExists, startRun, type Bindings } from "./runs";
 
@@ -183,6 +184,25 @@ app.post("/internal/events/run-finished", async (c) => {
 });
 
 // One attempt to POST the result of a run to its callback URL (`results.ts`); QStash retries a 502.
+// The runner reports that a run reached another node (or started waiting): `run.node` to the status callbacks that
+// follow nodes, carrying where the run is when this message arrives. Nothing once the run has ended (`run.finished` says it).
+app.post("/internal/events/run-node", async (c) => {
+  const checked = await verifiedQstashBody(c);
+  if ("error" in checked) return c.json({ error: checked.error }, checked.status);
+  let runId: unknown;
+  try {
+    runId = (JSON.parse(checked.body) as { runId?: unknown }).runId;
+  } catch {
+    return c.json({ error: "invalid_json" }, 400);
+  }
+  if (typeof runId !== "string" || !UUID.test(runId)) return c.json({ error: "runId_must_be_a_uuid" }, 400);
+  const sql = c.var.sql;
+  const [run] = await sql`select status from runs where id = ${runId}::uuid`;
+  if (!run || run.status !== "running") return c.json({ status: "not_running" });
+  const sent = await scheduleDeliveries(sql, c.env, { runId, event: "run.node", origin: c.env.PUBLIC_URL || new URL(c.req.url).origin });
+  return c.json({ status: "ok", sent });
+});
+
 app.post("/internal/callbacks/deliver", async (c) => {
   const checked = await verifiedQstashBody(c);
   if ("error" in checked) return c.json({ error: checked.error }, checked.status);
