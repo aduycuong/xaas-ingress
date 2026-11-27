@@ -1,4 +1,4 @@
-// The end of a run: give its trigger's slot to the next waiting run, and fire the `event` triggers
+// The end of a run: give its workflow's slot to the next waiting run, and fire the `event` triggers
 // listening to this kind of ending. A workflow cannot start itself through events: a trigger whose
 // workflow already appears in the chain of runs that led here is not fired.
 
@@ -36,12 +36,13 @@ export async function handleRunFinished(
   if (!run || run.test) return { queuedStarted: 0, fired: 0, blocked: 0, callback };
   const done = (counts: { queuedStarted: number; fired: number; blocked: number }) => ({ ...counts, callback });
 
-  const queuedStarted = run.trigger_id ? await dispatchQueued(sql, env, run.trigger_id) : 0;
+  const queuedStarted = await dispatchQueued(sql, env, run.workflow_id);
   if (run.status !== "succeeded" && run.status !== "failed") return done({ queuedStarted, fired: 0, blocked: 0 });
 
   const triggers = (await sql`
     select t.id, t.type, t.enabled, t.workspace_id, t.workflow_id, t.auth_mode, t.auth_secret, t.filter, t.input_mapping,
-      t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, t.env, w.status as workflow_status, w.current_version_id
+      t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, t.env, w.status as workflow_status, w.current_version_id,
+      t.when_full, w.max_active_runs, w.queue_cap
     from triggers t join workflows w on w.id = t.workflow_id
     where t.workspace_id = ${run.workspace_id}::uuid and t.type = 'event' and t.enabled
       and t.event_type = ${`run.${run.status}`} and (t.event_workflow_id is null or t.event_workflow_id = ${run.workflow_id}::uuid)`) as unknown as TriggerRow[];

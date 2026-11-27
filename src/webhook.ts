@@ -104,3 +104,59 @@ export function safeHeaders(headers: Headers): Record<string, string> {
   });
   return out;
 }
+
+// ---------- Authentications of the workspace (milestone 19 of the app) ----------
+
+export type KeyMethod = "bearer" | "hmac" | "none";
+
+/** Public key id of a secret of an authentication: `xa_` + 6 characters. */
+export const KEY_ID = /^xa_[a-z0-9]{6}$/;
+
+/**
+ * What an HMAC caller signs with the secret of an authentication. The path is in it because one key may call many
+ * triggers: a call signed for one URL does not pass at another. A read (`GET`) signs an empty body.
+ */
+export const keySigned = (timestamp: string, method: string, path: string, rawBody: string) => `${timestamp}.${method.toUpperCase()}.${path}.${rawBody}`;
+
+/**
+ * Checks a call against the authentication its trigger uses. `none` lets anything in. With `Authorization`, the bearer
+ * token is `<key id>.<secret>`; with `X-Xaas-Signature`, the caller names the key in `X-Xaas-Key-Id` and signs
+ * `keySigned(...)` with a timestamp (required). `secretOf` gives the secret of a key id of this authentication (not
+ * revoked), or null. Returns the problem, or null and the key id that passed.
+ */
+export async function checkKeyAuth(params: {
+  methods: KeyMethod[];
+  secretOf: (keyId: string) => Promise<string | null>;
+  method: string;
+  path: string;
+  rawBody: string;
+  headers: Headers;
+  now?: number;
+}): Promise<{ problem: AuthProblem | null; keyId: string | null }> {
+  const { methods, headers } = params;
+  if (methods.includes("none")) return { problem: null, keyId: null };
+  const invalid = { problem: "invalid_signature" as const, keyId: null };
+
+  const authorization = headers.get("authorization");
+  if (authorization !== null) {
+    if (!methods.includes("bearer")) return invalid;
+    const match = /^Bearer\s+(xa_[a-z0-9]{6})\.(\S+)$/.exec(authorization.trim());
+    if (!match) return invalid;
+    const secret = await params.secretOf(match[1]);
+    return secret && sameSecret(match[2], secret) ? { problem: null, keyId: match[1] } : invalid;
+  }
+
+  const signature = headers.get("x-xaas-signature");
+  if (signature !== null) {
+    if (!methods.includes("hmac")) return invalid;
+    const keyId = headers.get("x-xaas-key-id")?.trim() ?? "";
+    const timestamp = headers.get("x-xaas-timestamp");
+    if (!KEY_ID.test(keyId) || timestamp === null) return { problem: "missing_auth", keyId: null };
+    const problem = checkTimestamp(timestamp, params.now ?? Date.now());
+    if (problem) return { problem, keyId: null };
+    const secret = await params.secretOf(keyId);
+    if (!secret) return invalid;
+    return (await sameSignature(signature, secret, keySigned(timestamp.trim(), params.method, params.path, params.rawBody))) ? { problem: null, keyId } : invalid;
+  }
+  return { problem: "missing_auth", keyId: null };
+}

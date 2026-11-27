@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { callbackBody, MAX_CALLBACK_OUTPUT_BYTES, statusUrlOf, toRunNode, toRunResult } from "./results";
+import { callbackBody, MAX_CALLBACK_OUTPUT_BYTES, statusUrlOf, toRunNode, toRunResult, whereRunIs } from "./results";
 
 const row = { id: "0193aaaa-0000-7000-8000-000000000000", no: 42, version: 3, status: "succeeded" as const, env: "production", created_at: new Date("2026-11-26T08:00:00Z"), started_at: "2026-11-26T08:00:01Z", finished_at: new Date("2026-11-26T08:00:12Z"), output: { ok: true }, error: null };
 
@@ -19,7 +19,7 @@ test("a run as its caller sees it", () => {
   const url = statusUrlOf("https://ingress.xaas.im/", "tok", row.id);
   assert.equal(url, `https://ingress.xaas.im/wh/tok/runs/${row.id}`);
   assert.deepEqual(toRunResult(row, nodes, url), {
-    runId: row.id, no: 42, version: 3, status: "succeeded", env: "production", createdAt: "2026-11-26T08:00:00.000Z", startedAt: "2026-11-26T08:00:01.000Z", finishedAt: "2026-11-26T08:00:12.000Z", output: { ok: true }, error: null, nodes, statusUrl: url,
+    runId: row.id, no: 42, version: 3, status: "succeeded", env: "production", createdAt: "2026-11-26T08:00:00.000Z", startedAt: "2026-11-26T08:00:01.000Z", finishedAt: "2026-11-26T08:00:12.000Z", output: { ok: true }, error: null, nodes, current: [], waiting: null, statusUrl: url,
   });
   // Only a succeeded run has an output; an error keeps its code and message only.
   const failed = toRunResult({ ...row, status: "failed", output: { partial: 1 }, error: { code: "NODE_FAILED", message: "boom", detail: "x" } as never }, [], url);
@@ -36,4 +36,24 @@ test("a callback carries the event, the result and its nodes; a too large output
   assert.equal(body.outputOmitted, true);
   assert.equal(body.nodes.length, 2);
   assert.equal(body.statusUrl, "https://i/wh/t/runs/r");
+});
+
+test("where a run is: the nodes running now, and what it waits for (an async node; a person for human.*)", () => {
+  const now = whereRunIs([
+    { node_id: "score", label: "Score lead", started_at: "2026-11-27T09:14:01Z", key: "ai.llm", mode: "sync" },
+    { node_id: "approve", label: "Approve", started_at: new Date("2026-11-27T09:14:02Z"), key: "human.ask", mode: "async" },
+  ]);
+  assert.deepEqual(now.current, [
+    { id: "score", label: "Score lead", key: "ai.llm", since: "2026-11-27T09:14:01.000Z" },
+    { id: "approve", label: "Approve", key: "human.ask", since: "2026-11-27T09:14:02.000Z" },
+  ]);
+  assert.deepEqual(now.waiting, { kind: "human", node: "approve" });
+  assert.deepEqual(whereRunIs([{ node_id: "ocr", label: null, started_at: "2026-11-27T09:14:01Z", key: "image.ocr", mode: "async" }]).waiting, { kind: "async", node: "ocr" });
+  assert.deepEqual(whereRunIs([]), { current: [], waiting: null });
+  // Only a running run says where it is.
+  const ended = toRunResult(row, nodes, "u", now);
+  assert.deepEqual([ended.current, ended.waiting], [[], null]);
+  const running = toRunResult({ ...row, status: "running" }, nodes, "u", now);
+  assert.equal(running.current.length, 2);
+  assert.deepEqual(running.waiting, { kind: "human", node: "approve" });
 });

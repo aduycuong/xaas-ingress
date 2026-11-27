@@ -32,6 +32,12 @@ export type RunNode = {
   error: { code: string; message: string } | null;
 };
 
+/** A node the run is at now: running (several when branches run side by side). */
+export type CurrentNode = { id: string; label: string | null; key: string | null; since: string };
+
+/** What a running run waits for: a person (Ask human) or an async node (a service that reports back). */
+export type RunWaiting = { kind: "human" | "async"; node: string } | null;
+
 export type RunResult = {
   runId: string;
   no: number;
@@ -46,6 +52,10 @@ export type RunResult = {
   output: unknown;
   error: { code: string; message: string } | null;
   nodes: RunNode[];
+  /** The nodes running now; empty once the run has ended (or before it starts). No progress or percent: loops make them wrong. */
+  current: CurrentNode[];
+  /** What the run waits for now, or null. */
+  waiting: RunWaiting;
   statusUrl: string;
 };
 
@@ -65,13 +75,34 @@ async function loadRunNodes(sql: Sql, runId: string): Promise<RunNode[]> {
   return (rows as NodeRow[]).map(toRunNode);
 }
 
+type RunningRow = { node_id: string; label: string | null; started_at: Date | string; key: string | null; mode: string | null };
+
+/**
+ * Where a run is now, from its running node runs: `current` lists them; `waiting` is the first one of an async node
+ * (`node_versions.mode`), a person for `human.*` nodes. Pure, so the rules are testable.
+ */
+export function whereRunIs(running: RunningRow[]): { current: CurrentNode[]; waiting: RunWaiting } {
+  const current = running.map((row) => ({ id: row.node_id, label: row.label, key: row.key, since: iso(row.started_at) as string }));
+  const waits = running.find((row) => row.mode === "async");
+  return { current, waiting: waits ? { kind: waits.key?.startsWith("human.") ? "human" : "async", node: waits.node_id } : null };
+}
+
+async function loadWhereRunIs(sql: Sql, runId: string): Promise<{ current: CurrentNode[]; waiting: RunWaiting }> {
+  const rows = await sql`
+    select nr.node_id, nr.label, nr.started_at, n.key, nv.mode
+    from node_runs nr left join node_versions nv on nv.id = nr.node_version_id left join nodes n on n.id = nv.node_id
+    where nr.run_id = ${runId}::uuid and nr.status = 'running' order by nr.started_at, nr.node_id`;
+  return whereRunIs(rows as RunningRow[]);
+}
+
 const iso = (value: Date | string | null) => (value === null ? null : new Date(value).toISOString());
 
 export const isEnded = (status: string) => (ENDED_STATUSES as readonly string[]).includes(status);
 
 export const statusUrlOf = (origin: string, token: string, runId: string) => `${origin.replace(/\/$/, "")}/wh/${token}/runs/${runId}`;
 
-export function toRunResult(row: RunRow, nodes: RunNode[], statusUrl: string): RunResult {
+export function toRunResult(row: RunRow, nodes: RunNode[], statusUrl: string, now: { current: CurrentNode[]; waiting: RunWaiting } = { current: [], waiting: null }): RunResult {
+  const running = row.status === "running";
   return {
     runId: row.id,
     no: Number(row.no),
@@ -84,6 +115,8 @@ export function toRunResult(row: RunRow, nodes: RunNode[], statusUrl: string): R
     output: row.status === "succeeded" ? (row.output ?? null) : null,
     error: publicError(row.error),
     nodes,
+    current: running ? now.current : [],
+    waiting: running ? now.waiting : null,
     statusUrl,
   };
 }
@@ -101,7 +134,9 @@ export async function loadRunResult(sql: Sql, params: { triggerId: string; runId
     select r.id, r.no, v.version, r.status, r.env, r.created_at, r.started_at, r.finished_at, r.output, r.error
     from runs r join workflow_versions v on v.id = r.workflow_version_id
     where r.id = ${params.runId}::uuid and r.trigger_id = ${params.triggerId}::uuid and r.test is null`;
-  return row ? toRunResult(row as RunRow, await loadRunNodes(sql, params.runId), params.statusUrl) : null;
+  if (!row) return null;
+  const [nodes, now] = await Promise.all([loadRunNodes(sql, params.runId), row.status === "running" ? loadWhereRunIs(sql, params.runId) : Promise.resolve({ current: [], waiting: null })]);
+  return toRunResult(row as RunRow, nodes, params.statusUrl, now);
 }
 
 /**
