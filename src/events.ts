@@ -41,8 +41,8 @@ export async function handleRunFinished(
   if (run.status !== "succeeded" && run.status !== "failed") return done({ queuedStarted, fired: 0, blocked: 0 });
 
   const triggers = (await sql`
-    select t.id, t.type, t.enabled, t.workspace_id, t.workflow_id, t.auth_mode, t.auth_secret, t.filter, t.input_mapping,
-      t.concurrency_policy, t.concurrency_max, t.rate_limit_per_minute, t.env, w.status as workflow_status, w.current_version_id,
+    select t.id, t.type, t.enabled, t.workspace_id, t.workflow_id, t.filter, t.input_mapping,
+      t.env, w.status as workflow_status, w.current_version_id,
       t.when_full, w.max_active_runs, w.queue_cap, w.callback_allowed_origins as callback_origins
     from triggers t join workflows w on w.id = t.workflow_id
     where t.workspace_id = ${run.workspace_id}::uuid and t.type = 'event' and t.enabled
