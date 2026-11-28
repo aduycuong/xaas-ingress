@@ -2,7 +2,7 @@
 // pattern matches. A file a run wrote carries that run as its cause, so a workflow cannot start itself again through the
 // files it writes (the same chain check as run events).
 
-import { chainBlocks } from "./events";
+import { causeChain, chainBlocks } from "./events";
 import { type TriggerRow, fireTrigger, logTriggerEvent } from "./fire";
 import { matchesPathPattern } from "./path-pattern";
 import type { Bindings, Sql } from "./runs";
@@ -55,14 +55,7 @@ export async function handleFileEvent(sql: Sql, env: Bindings, message: { fileId
   )) as unknown as (TriggerRow & { path_pattern: string | null })[]).filter((trigger) => matchesPathPattern(trigger.path_pattern, path));
   if (!triggers.length) return { fired: 0, blocked: 0, matched: 0 };
 
-  const chain = message.causeRunId
-    ? ((await sql`
-        with recursive chain as (
-          select id, workflow_id, cause_run_id, 1 as depth from runs where id = ${message.causeRunId}::uuid
-          union all
-          select r.id, r.workflow_id, r.cause_run_id, c.depth + 1 from runs r join chain c on r.id = c.cause_run_id where c.depth < 10
-        ) select workflow_id from chain`) as unknown as { workflow_id: string }[])
-    : [];
+  const chain = message.causeRunId ? await causeChain(sql, message.causeRunId) : [];
 
   const payload = payloadOf(message.event, file);
   let fired = 0;

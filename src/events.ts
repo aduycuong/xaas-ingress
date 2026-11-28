@@ -15,6 +15,16 @@ export function chainBlocks(chain: { workflow_id: string }[], targetWorkflowId: 
   return chain.some((link) => link.workflow_id === targetWorkflowId) ? "loop_detected" : null;
 }
 
+/** Workflow ids of the run and of every run that caused it (`cause_run_id`), nearest first: what `chainBlocks` reads. */
+export async function causeChain(sql: Sql, runId: string): Promise<{ workflow_id: string }[]> {
+  return (await sql`
+    with recursive chain as (
+      select id, workflow_id, cause_run_id, 1 as depth from runs where id = ${runId}::uuid
+      union all
+      select r.id, r.workflow_id, r.cause_run_id, c.depth + 1 from runs r join chain c on r.id = c.cause_run_id where c.depth < 10
+    ) select workflow_id from chain order by depth`) as unknown as { workflow_id: string }[];
+}
+
 /**
  * `callbackOnly`: the app ended the run itself (cancelled it, or the stuck sweep failed it) and already gave its slot
  * away; only the `run.finished` events of its status callbacks are left to send.
@@ -49,12 +59,7 @@ export async function handleRunFinished(
       and t.event_type = ${`run.${run.status}`} and (t.event_workflow_id is null or t.event_workflow_id = ${run.workflow_id}::uuid)`) as unknown as TriggerRow[];
   if (triggers.length === 0) return done({ queuedStarted, fired: 0, blocked: 0 });
 
-  const chain = (await sql`
-    with recursive chain as (
-      select id, workflow_id, cause_run_id, 1 as depth from runs where id = ${runId}::uuid
-      union all
-      select r.id, r.workflow_id, r.cause_run_id, c.depth + 1 from runs r join chain c on r.id = c.cause_run_id where c.depth < 10
-    ) select workflow_id from chain`) as unknown as { workflow_id: string }[];
+  const chain = await causeChain(sql, runId);
 
   const payload = {
     event: `run.${run.status}`,
