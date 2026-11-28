@@ -78,10 +78,26 @@ export async function inputSchemaOf(sql: Sql, versionId: string): Promise<Record
 /** An API trigger (`manual` is its old name): the caller sends the input and picks the environment. */
 export const isApiTrigger = (trigger: Pick<TriggerRow, "type">) => trigger.type === "api" || trigger.type === "manual";
 
-/** Records one call of a trigger: the run it started, or why it did not. Never throws: the record is not worth failing a call over. */
-export async function logTriggerEvent(sql: Sql, trigger: Pick<TriggerRow, "id" | "workspace_id">, outcome: "fired" | "rejected" | "skipped", reason: string | null, runId: string | null) {
+/** Past this, a call's payload is not kept on its trigger event, only its size. */
+const PAYLOAD_MAX_BYTES = 64 * 1024;
+
+/** The JSON a trigger event keeps of a call: the call itself, or `{ truncated, size }` when it is too big. */
+function payloadJson(payload: CallParts): string {
+  const json = JSON.stringify(payload);
+  const size = new TextEncoder().encode(json).length;
+  return size > PAYLOAD_MAX_BYTES ? JSON.stringify({ truncated: true, size }) : json;
+}
+
+/**
+ * Records one call of a trigger: the run it started, or why it did not. `extra.payload` is what an authenticated call that
+ * did not start a run carried, so its owner can see why it was refused; `extra.problems` what did not fit the input schema.
+ * Never throws: the record is not worth failing a call over.
+ */
+export async function logTriggerEvent(sql: Sql, trigger: Pick<TriggerRow, "id" | "workspace_id">, outcome: "fired" | "rejected" | "skipped", reason: string | null, runId: string | null, extra: { payload?: CallParts; problems?: InputProblem[] } = {}) {
+  const payload = extra.payload ? payloadJson(extra.payload) : null;
+  const problems = extra.problems?.length ? JSON.stringify(extra.problems) : null;
   try {
-    await sql`insert into trigger_events (id, trigger_id, workspace_id, outcome, reason, run_id) values (${uuidv7()}, ${trigger.id}, ${trigger.workspace_id}, ${outcome}, ${reason}, ${runId}::uuid)`;
+    await sql`insert into trigger_events (id, trigger_id, workspace_id, outcome, reason, run_id, payload, problems) values (${uuidv7()}, ${trigger.id}, ${trigger.workspace_id}, ${outcome}, ${reason}, ${runId}::uuid, ${payload}::jsonb, ${problems}::jsonb)`;
   } catch (error) {
     console.warn("[ingress] could not record a trigger event", error);
   }
@@ -153,12 +169,15 @@ export type Call = {
  * mapping, then the run under the concurrency policy. Every outcome is recorded.
  */
 export async function fireTrigger(sql: Sql, env: Bindings, trigger: TriggerRow, call: Call): Promise<FireOutcome> {
+  // The raw call: what `{{ trigger… }}` reads in the filter, the mapping and (stored with the run) the workflow. A call that
+  // starts no run keeps it on its trigger event instead, except a rate-limited one (a flood is not worth storing).
+  const triggerData: CallParts = { body: call.body, headers: call.headers ? safeHeaders(call.headers) : {}, query: call.query ?? {}, ...(trigger.type === "cron" ? { scheduledAt: new Date().toISOString() } : {}) };
   const skip = async (reason: Extract<FireOutcome, { kind: "skipped" }>["reason"]): Promise<FireOutcome> => {
-    await logTriggerEvent(sql, trigger, "skipped", reason, null);
+    await logTriggerEvent(sql, trigger, "skipped", reason, null, { payload: triggerData });
     return { kind: "skipped", reason };
   };
   const reject = async (reason: Exclude<Extract<FireOutcome, { kind: "rejected" }>["reason"], "invalid_input">, status: 401 | 422 | 429): Promise<FireOutcome> => {
-    await logTriggerEvent(sql, trigger, "rejected", reason, null);
+    await logTriggerEvent(sql, trigger, "rejected", reason, null, reason === "rate_limited" ? {} : { payload: triggerData });
     return { kind: "rejected", reason, status };
   };
 
@@ -188,8 +207,6 @@ export async function fireTrigger(sql: Sql, env: Bindings, trigger: TriggerRow, 
     callbackUrl = target.url;
   }
 
-  // The raw call: what `{{ trigger… }}` reads in the filter, the mapping and (stored with the run) the workflow.
-  const triggerData: CallParts = { body: call.body, headers: call.headers ? safeHeaders(call.headers) : {}, query: call.query ?? {}, ...(trigger.type === "cron" ? { scheduledAt: new Date().toISOString() } : {}) };
   const scope = callScope(triggerData);
   if (call.source !== "api" && call.source !== "schedule" && !(await passesFilter(trigger.filter, scope))) return reject("filter_not_matched", 422);
 
@@ -199,7 +216,7 @@ export async function fireTrigger(sql: Sql, env: Bindings, trigger: TriggerRow, 
   // Every trigger's input (webhook, API, event, schedule, "Fire now") must fit the input schema of the version that runs.
   const problems = validateInput(await inputSchemaOf(sql, trigger.current_version_id), input);
   if (problems.length) {
-    await logTriggerEvent(sql, trigger, "rejected", "invalid_input", null);
+    await logTriggerEvent(sql, trigger, "rejected", "invalid_input", null, { payload: triggerData, problems });
     return { kind: "rejected", reason: "invalid_input", status: 422, problems };
   }
   const inserted = await startRun(sql, env, {
