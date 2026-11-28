@@ -4,6 +4,7 @@
 //   POST /internal/triggers/:id/fire         QStash schedule of a cron trigger (Upstash signature)
 //   POST /internal/events/run-finished       QStash message from the runner (or the app) when a run ends (Upstash signature)
 //   POST /internal/events/run-node           QStash message from the runner: the run reached another node (at most every 5 s per run)
+//   POST /internal/events/emit               node `core.emit_event` of a run: start the `custom` triggers of the name (signed by the runner)
 //   POST /internal/callbacks/deliver         QStash: one attempt to POST an event of a run to a status callback (Upstash signature)
 //   POST /triggers/:id/fire                  "Fire now" from the xaas-workflows app (bearer token)
 //   POST /dispatch-queued                    the app's sweep: start queued runs whose workflow has a free slot (bearer token)
@@ -20,6 +21,7 @@ import { sameSecret } from "./crypto";
 import { connect, databaseUrl, type Sql } from "./db";
 import { handleCallback } from "./callbacks";
 import { emitConnectionEvent, facebookEvents, facebookSignatureValid, learnTelegramChat, sha256Hex, telegramChatOf, telegramEvent, touchSubscription } from "./connection-events";
+import { emitSignatureValid, handleEmit } from "./emit";
 import { handleRunFinished } from "./events";
 import { fileEvents, fireWithFile, handleFileEvent, type FileEvent } from "./file-events";
 import { authenticate, fireTrigger, isApiTrigger, loadTriggerById, loadTriggerByToken, logTriggerEvent, type FireOutcome } from "./fire";
@@ -217,6 +219,29 @@ app.post("/internal/callbacks/deliver", async (c) => {
   const retried = Number(c.req.header("upstash-retried") ?? "0");
   const delivery = await deliverRunEvent(c.var.sql, c.env, { deliveryId, ingressOrigin: c.env.PUBLIC_URL || new URL(c.req.url).origin, retried: Number.isFinite(retried) ? retried : 0 });
   return c.json(delivery.body, delivery.status);
+});
+
+// A run's node `core.emit_event` (milestone 20), signed by the runner with CALLBACK_SIGNING_KEY. The answer (what each
+// listening trigger did) is the node's output. Its payload may be 256 KB, so the body may be a little bigger than a call's.
+app.post("/internal/events/emit", async (c) => {
+  if (!c.env.CALLBACK_SIGNING_KEY) return c.json({ error: "signing_key_not_configured" }, 503);
+  const raw = await c.req.text();
+  if (raw.length > MAX_BODY_BYTES + 16 * 1024) return c.json({ error: "payload_too_large" }, 413);
+  if (!(await emitSignatureValid(c.env.CALLBACK_SIGNING_KEY, c.req.header("x-xaas-timestamp"), c.req.header("x-xaas-signature"), raw))) return c.json({ error: "invalid_signature" }, 401);
+  let message: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!isRecord(parsed)) return c.json({ error: "body_must_be_a_json_object" }, 400);
+    message = parsed;
+  } catch {
+    return c.json({ error: "invalid_json" }, 400);
+  }
+  const { runId, nodeRunId, event, payload } = message;
+  if (typeof runId !== "string" || !UUID.test(runId) || typeof nodeRunId !== "string" || !UUID.test(nodeRunId)) return c.json({ error: "ids_must_be_uuids" }, 400);
+  if (typeof event !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/.test(event)) return c.json({ error: "invalid_event_name" }, 400);
+  if (!isRecord(payload)) return c.json({ error: "payload_must_be_a_json_object" }, 400);
+  const answer = await handleEmit(c.var.sql, c.env, { runId, nodeRunId, event, payload });
+  return answer ? c.json(answer) : c.json({ error: "not_found" }, 404);
 });
 
 app.post("/internal/events/file", async (c) => {
